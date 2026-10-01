@@ -8,6 +8,7 @@ from math import floor
 
 import limits.typing
 from limits.storage.base import (
+    GCRASupport,
     MovingWindowSupport,
     SlidingWindowCounterSupport,
     Storage,
@@ -22,22 +23,36 @@ class Entry:
 
 
 class MemoryStorage(
-    Storage, MovingWindowSupport, SlidingWindowCounterSupport, TimestampedSlidingWindow
+    Storage,
+    MovingWindowSupport,
+    SlidingWindowCounterSupport,
+    GCRASupport,
+    TimestampedSlidingWindow,
 ):
     """
     rate limit storage using :class:`collections.Counter`
     as an in memory storage for fixed and sliding window strategies,
-    and a simple list to implement moving window strategy.
+    a simple list to implement moving window strategy,
+    and a single theoretical arrival time per key to implement
+    the gcra strategy.
 
     """
 
     STORAGE_SCHEME = ["memory"]
 
-    def __init__(self, uri: str | None = None, wrap_exceptions: bool = False, **_: str):
+    def __init__(
+        self,
+        uri: str | None = None,
+        wrap_exceptions: bool = False,
+        clock: limits.typing.Callable[[], float] | None = None,
+        **_: str,
+    ):
         self.storage: limits.typing.Counter[str] = Counter()
         self.locks: defaultdict[str, threading.RLock] = defaultdict(threading.RLock)
         self.expirations: dict[str, float] = {}
         self.events: dict[str, list[Entry]] = {}
+        self.gcra: dict[str, float] = {}
+        self._clock = clock or time.time
         self._timer_lock = threading.Lock()
         self.timer: threading.Timer = threading.Timer(0.01, self.__expire_events)
         self.timer.start()
@@ -48,6 +63,8 @@ class MemoryStorage(
         del state["timer"]
         del state["locks"]
         del state["_timer_lock"]
+        if state["_clock"] is not time.time:
+            state["_clock"] = time.time
         return state
 
     def __setstate__(self, state: dict[str, limits.typing.Any]) -> None:  # type: ignore[explicit-any]
@@ -72,6 +89,11 @@ class MemoryStorage(
                 self.storage.pop(key, None)
                 self.expirations.pop(key, None)
                 self.locks.pop(key, None)
+        now = self._clock()
+        for key in list(self.gcra.keys()):
+            with self.locks[key]:
+                if self.gcra.get(key, now) <= now:
+                    self.gcra.pop(key, None)
 
     def __schedule_expiry(self) -> None:
         with self._timer_lock:
@@ -134,6 +156,7 @@ class MemoryStorage(
         self.storage.pop(key, None)
         self.expirations.pop(key, None)
         self.events.pop(key, None)
+        self.gcra.pop(key, None)
         self.locks.pop(key, None)
 
     def acquire_entry(self, key: str, limit: int, expiry: int, amount: int = 1) -> bool:
@@ -247,6 +270,49 @@ class MemoryStorage(
         self.clear(previous_key)
         self.clear(current_key)
 
+    def acquire_gcra_entry(
+        self,
+        key: str,
+        emission_interval: float,
+        burst_tolerance: float,
+        cost: int = 1,
+    ) -> bool:
+        """
+        :param key: rate limit key to acquire an entry in
+        :param emission_interval: the average interval between two requests
+         allowed by the rate, in seconds
+        :param burst_tolerance: the maximum tolerated deviation from the
+         theoretical arrival time, in seconds
+        :param cost: the number of units to acquire
+        """
+        if (cost - 1) * emission_interval > burst_tolerance:
+            return False
+
+        self.__schedule_expiry()
+        with self.locks[key]:
+            now = self._clock()
+            tat = self.gcra.get(key)
+            if tat is None or tat <= now:
+                tat = now
+            new_tat = tat + cost * emission_interval
+            if new_tat - emission_interval > now + burst_tolerance:
+                return False
+            self.gcra[key] = new_tat
+            return True
+
+    def get_gcra_state(self, key: str) -> tuple[float, float]:
+        """
+        :param key: rate limit key
+        :return: (theoretical arrival time, current time)
+        """
+        with self.locks[key]:
+            now = self._clock()
+            tat = self.gcra.get(key)
+            if tat is None or tat <= now:
+                self.gcra.pop(key, None)
+                return now, now
+            return tat, now
+
     def check(self) -> bool:
         """
         check if storage is healthy
@@ -255,9 +321,10 @@ class MemoryStorage(
         return True
 
     def reset(self) -> int | None:
-        num_items = max(len(self.storage), len(self.events))
+        num_items = max(len(self.storage), len(self.events), len(self.gcra))
         self.storage.clear()
         self.expirations.clear()
         self.events.clear()
+        self.gcra.clear()
         self.locks.clear()
         return num_items

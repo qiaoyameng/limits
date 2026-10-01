@@ -59,6 +59,23 @@ def async_fixed_start(fn):
     return __inner
 
 
+class ManualClock:
+    """
+    A monotonic clock that only advances when told to,
+    for deterministic rate limiting tests.
+    """
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        assert seconds >= 0
+        self.now += seconds
+
+
 @contextlib.contextmanager
 def window(delay_end: float, delay: float | None = None):
     start = time.time()

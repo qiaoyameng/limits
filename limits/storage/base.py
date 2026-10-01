@@ -222,6 +222,59 @@ class SlidingWindowCounterSupport(ABC):
         ...
 
 
+class GCRASupport(ABC):
+    """
+    Abstract base class for storages that support
+    the :ref:`strategies:gcra` strategy
+    """
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:  # type: ignore[explicit-any]
+        for method in {
+            "acquire_gcra_entry",
+            "get_gcra_state",
+        }:
+            setattr(
+                cls,
+                method,
+                _wrap_errors(getattr(cls, method)),
+            )
+        super().__init_subclass__(**kwargs)
+
+    @abstractmethod
+    def acquire_gcra_entry(
+        self,
+        key: str,
+        emission_interval: float,
+        burst_tolerance: float,
+        cost: int = 1,
+    ) -> bool:
+        """
+        Acquire an entry if the theoretical arrival time of the request
+        does not exceed the burst tolerance, and advance the theoretical
+        arrival time stored for the key.
+
+        :param key: rate limit key to acquire an entry in
+        :param emission_interval: the average interval between two requests
+         allowed by the rate, in seconds
+        :param burst_tolerance: the maximum tolerated deviation from the
+         theoretical arrival time, in seconds
+        :param cost: the number of units to acquire
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_gcra_state(self, key: str) -> tuple[float, float]:
+        """
+        Return the current GCRA state for the key without modifying it.
+
+        :param key: rate limit key
+        :return: a tuple of (theoretical arrival time, current time). When the
+         key has no state or its state has fully drained, the theoretical
+         arrival time is the current time.
+        """
+        raise NotImplementedError
+
+
 class TimestampedSlidingWindow:
     """Helper class for storage that support the sliding window counter, with timestamp based keys."""
 

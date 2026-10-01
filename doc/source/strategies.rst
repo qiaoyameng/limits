@@ -17,6 +17,10 @@ TL;DR: How to choose a strategy
   smooths transitions between time periods with less overhead than a full moving window,
   though it may trade off some precision near bucket boundaries.
 
+- **GCRA:**
+  Use when exactly accurate rate limiting with smooth, evenly spaced requests is
+  required, with a memory footprint of a single timestamp per resource and rate limit.
+
 Fixed Window
 ============
 
@@ -131,4 +135,40 @@ Suppose:
    period. The affected implementations are ``memcached`` and ``in-memory``.
 
 
+GCRA
+====
+.. versionadded:: 5.9
 
+This strategy implements the `Generic Cell Rate Algorithm
+<https://en.wikipedia.org/wiki/Generic_cell_rate_algorithm>`_ (a variant of the
+leaky bucket). Instead of keeping a counter or a log of requests, it stores a single
+**theoretical arrival time** per resource and rate limit: the time at which the next
+request would be expected if requests arrived exactly at the allowed average rate.
+
+For a rate limit of ``amount`` requests per ``expiry`` seconds, the strategy derives:
+
+- **Emission interval** (:math:`T`): the average spacing between two requests allowed
+  by the rate, :math:`T = \frac{expiry}{amount}`.
+- **Burst capacity**: the maximum number of units that can be consumed
+  instantaneously, equal to ``amount``. A single hit whose cost exceeds the burst
+  capacity can never be satisfied and is always rejected.
+- **Burst tolerance** (:math:`\tau`): the maximum tolerated deviation from the
+  theoretical arrival time, :math:`\tau = (amount - 1) \times T`.
+
+A hit with cost ``c`` is allowed when the theoretical arrival time, shifted by the
+cost, stays within the burst tolerance:
+
+.. math::
+
+    \max(TAT, t_{now}) + (c - 1) \times T \leq t_{now} + \tau
+
+and, when allowed, the theoretical arrival time is advanced by :math:`c \times T`.
+Rejected hits never advance the theoretical arrival time.
+
+For example, with a rate limit of ``10 requests per minute``
+(:math:`T = 6` seconds, burst capacity ``10``):
+
+- A client that has been idle can send 10 requests immediately, which are all allowed.
+- The 11th request is rejected, as it would exceed the burst tolerance.
+- Every 6 seconds, capacity for one more request is recovered.
+- A client sending exactly one request every 6 seconds is never limited.

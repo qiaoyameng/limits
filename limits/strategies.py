@@ -10,7 +10,7 @@ from math import floor, inf
 
 from deprecated.sphinx import versionadded
 
-from limits.storage.base import SlidingWindowCounterSupport
+from limits.storage.base import GCRASupport, SlidingWindowCounterSupport
 
 from .limits import RateLimitItem
 from .storage import MovingWindowSupport, Storage, StorageTypes
@@ -191,6 +191,118 @@ class FixedWindowRateLimiter(RateLimiter):
         return WindowStats(reset, remaining)
 
 
+@versionadded(version="5.9")
+class GCRARateLimiter(RateLimiter):
+    """
+    Reference: :ref:`strategies:gcra`
+    """
+
+    def __init__(self, storage: StorageTypes):
+        if not (
+            hasattr(storage, "acquire_gcra_entry")
+            and hasattr(storage, "get_gcra_state")
+        ):
+            raise NotImplementedError(
+                "GCRARateLimiting is not implemented for storage "
+                f"of type {storage.__class__}"
+            )
+        super().__init__(storage)
+
+    def get_emission_interval(self, item: RateLimitItem) -> float:
+        """
+        The average interval between two requests allowed by the rate,
+        defined as the limit expiry divided by its amount, in seconds.
+
+        :param item: The rate limit item
+        """
+        return item.get_expiry() / item.amount
+
+    def get_burst_capacity(self, item: RateLimitItem) -> int:
+        """
+        The maximum number of units that can be consumed instantaneously,
+        defined as the limit amount. A single hit with a cost greater than
+        this capacity can never be satisfied and is always rejected.
+
+        :param item: The rate limit item
+        """
+        return item.amount
+
+    def get_burst_tolerance(self, item: RateLimitItem) -> float:
+        """
+        The maximum tolerated deviation from the theoretical arrival time,
+        derived from the burst capacity, in seconds.
+
+        :param item: The rate limit item
+        """
+        return (self.get_burst_capacity(item) - 1) * self.get_emission_interval(item)
+
+    def hit(self, item: RateLimitItem, *identifiers: str, cost: int = 1) -> bool:
+        """
+        Consume the rate limit
+
+        :param item: The rate limit item
+        :param identifiers: variable list of strings to uniquely identify this
+         instance of the limit
+        :param cost: The cost of this hit, default 1
+
+        :return: True if ``cost`` could be deducted from the rate limit without exceeding it
+        """
+
+        return cast(GCRASupport, self.storage).acquire_gcra_entry(
+            item.key_for(*identifiers),
+            self.get_emission_interval(item),
+            self.get_burst_tolerance(item),
+            cost=cost,
+        )
+
+    def test(self, item: RateLimitItem, *identifiers: str, cost: int = 1) -> bool:
+        """
+        Check if the rate limit can be consumed, without advancing the
+        theoretical arrival time.
+
+        :param item: The rate limit item
+        :param identifiers: variable list of strings to uniquely identify this
+         instance of the limit
+        :param cost: The expected cost to be consumed, default 1
+
+        :return: True if the rate limit is not depleted
+        """
+
+        if cost > self.get_burst_capacity(item):
+            return False
+        tat, now = cast(GCRASupport, self.storage).get_gcra_state(
+            item.key_for(*identifiers)
+        )
+
+        return (
+            tat + (cost - 1) * self.get_emission_interval(item)
+            <= now + self.get_burst_tolerance(item)
+        )
+
+    def get_window_stats(self, item: RateLimitItem, *identifiers: str) -> WindowStats:
+        """
+        Query the earliest time a unit cost hit would be allowed and the
+        remaining amount for the limit
+
+        :param item: The rate limit item
+        :param identifiers: variable list of strings to uniquely identify this
+         instance of the limit
+        :return: (reset time, remaining)
+        """
+        tat, now = cast(GCRASupport, self.storage).get_gcra_state(
+            item.key_for(*identifiers)
+        )
+        emission_interval = self.get_emission_interval(item)
+        burst_tolerance = self.get_burst_tolerance(item)
+
+        if tat > now + burst_tolerance:
+            remaining = 0
+        else:
+            remaining = floor((now + burst_tolerance - tat) / emission_interval) + 1
+
+        return WindowStats(max(now, tat - burst_tolerance), remaining)
+
+
 @versionadded(version="4.1")
 class SlidingWindowCounterRateLimiter(RateLimiter):
     """
@@ -309,10 +421,12 @@ KnownStrategy = (
     type[SlidingWindowCounterRateLimiter]
     | type[FixedWindowRateLimiter]
     | type[MovingWindowRateLimiter]
+    | type[GCRARateLimiter]
 )
 
 STRATEGIES: dict[str, KnownStrategy] = {
     "sliding-window-counter": SlidingWindowCounterRateLimiter,
     "fixed-window": FixedWindowRateLimiter,
     "moving-window": MovingWindowRateLimiter,
+    "gcra": GCRARateLimiter,
 }
