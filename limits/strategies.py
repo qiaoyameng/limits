@@ -6,10 +6,16 @@ from __future__ import annotations
 
 import time
 from abc import ABCMeta, abstractmethod
+from collections.abc import Sequence
 from math import floor, inf
 
 from deprecated.sphinx import versionadded
 
+from limits.combined import (
+    CombinedRateLimitRequest,
+    CombinedRateLimitResult,
+)
+from limits.storage.base import CombinedWindowSupport
 from limits.storage.base import SlidingWindowCounterSupport
 
 from .limits import RateLimitItem
@@ -65,6 +71,49 @@ class RateLimiter(metaclass=ABCMeta):
 
     def clear(self, item: RateLimitItem, *identifiers: str) -> None:
         return self.storage.clear(item.key_for(*identifiers))
+
+
+class CombinedRateLimiter(RateLimiter):
+    """Atomically consume a group of fixed and sliding window counters."""
+
+    def __init__(self, storage: StorageTypes):
+        if not isinstance(storage, CombinedWindowSupport):
+            raise NotImplementedError(
+                "Combined rate limiting is not implemented for storage "
+                f"of type {storage.__class__}"
+            )
+        super().__init__(storage)
+
+    def hit(
+        self,
+        item: RateLimitItem | None = None,
+        *identifiers: str,
+        cost: int = 1,
+    ) -> CombinedRateLimitResult:
+        raise NotImplementedError("Use CombinedRateLimiter.hit_many")
+
+    def test(
+        self,
+        item: RateLimitItem | None = None,
+        *identifiers: str,
+        cost: int = 1,
+    ) -> bool:
+        raise NotImplementedError("CombinedRateLimiter does not support test")
+
+    def get_window_stats(
+        self, item: RateLimitItem | None = None, *identifiers: str
+    ) -> WindowStats:
+        raise NotImplementedError("CombinedRateLimiter does not expose one window")
+
+    def hit_many(
+        self, requests: Sequence[CombinedRateLimitRequest]
+    ) -> CombinedRateLimitResult:
+        if not isinstance(self.storage, CombinedWindowSupport):
+            raise NotImplementedError(
+                "Combined rate limiting is not implemented for storage "
+                f"of type {self.storage.__class__}"
+            )
+        return cast(CombinedWindowSupport, self.storage).acquire_many(requests)
 
 
 class MovingWindowRateLimiter(RateLimiter):
@@ -190,6 +239,16 @@ class FixedWindowRateLimiter(RateLimiter):
 
         return WindowStats(reset, remaining)
 
+    def hit_many(
+        self, requests: Sequence[CombinedRateLimitRequest]
+    ) -> CombinedRateLimitResult:
+        if not isinstance(self.storage, CombinedWindowSupport):
+            raise NotImplementedError(
+                "Combined rate limiting is not implemented for storage "
+                f"of type {self.storage.__class__}"
+            )
+        return cast(CombinedWindowSupport, self.storage).acquire_many(requests)
+
 
 @versionadded(version="4.1")
 class SlidingWindowCounterRateLimiter(RateLimiter):
@@ -303,6 +362,11 @@ class SlidingWindowCounterRateLimiter(RateLimiter):
         return cast(SlidingWindowCounterSupport, self.storage).clear_sliding_window(
             item.key_for(*identifiers), item.get_expiry()
         )
+
+    def hit_many(
+        self, requests: Sequence[CombinedRateLimitRequest]
+    ) -> CombinedRateLimitResult:
+        return cast(CombinedWindowSupport, self.storage).acquire_many(requests)
 
 
 KnownStrategy = (

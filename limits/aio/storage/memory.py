@@ -4,12 +4,22 @@ import asyncio
 import bisect
 import time
 from collections import Counter, defaultdict
-from math import floor
+from collections.abc import Sequence
+from math import floor, inf
 
 from deprecated.sphinx import versionadded
 
+from limits.combined import (
+    CombinedRateLimitRequest,
+    CombinedRateLimitResult,
+    fixed_window_retry_at,
+    prepare_combined_requests,
+    sliding_window_retry_at,
+)
 import limits.typing
+from limits.typing import Callable
 from limits.aio.storage.base import (
+    CombinedWindowSupport,
     MovingWindowSupport,
     SlidingWindowCounterSupport,
     Storage,
@@ -25,7 +35,11 @@ class Entry:
 
 @versionadded(version="2.1")
 class MemoryStorage(
-    Storage, MovingWindowSupport, SlidingWindowCounterSupport, TimestampedSlidingWindow
+    Storage,
+    MovingWindowSupport,
+    SlidingWindowCounterSupport,
+    CombinedWindowSupport,
+    TimestampedSlidingWindow,
 ):
     """
     rate limit storage using :class:`collections.Counter`
@@ -40,24 +54,38 @@ class MemoryStorage(
     """
 
     def __init__(
-        self, uri: str | None = None, wrap_exceptions: bool = False, **_: str
+        self,
+        uri: str | None = None,
+        wrap_exceptions: bool = False,
+        clock: Callable[[], float] | None = None,
+        **_: str,
     ) -> None:
         self.storage: limits.typing.Counter[str] = Counter()
         self.locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self.expirations: dict[str, float] = {}
         self.events: dict[str, list[Entry]] = {}
+        self.clock = clock or time.time
+        self._custom_clock = clock is not None
+        self._state_lock: asyncio.Lock | None = None
         self.timer: asyncio.Task[None] | None = None
         super().__init__(uri, wrap_exceptions=wrap_exceptions, **_)
+
+    async def _get_state_lock(self) -> asyncio.Lock:
+        if self._state_lock is None:
+            self._state_lock = asyncio.Lock()
+        return self._state_lock
 
     def __getstate__(self) -> dict[str, limits.typing.Any]:  # type: ignore[explicit-any]
         state = self.__dict__.copy()
         del state["timer"]
         del state["locks"]
+        del state["_state_lock"]
         return state
 
     def __setstate__(self, state: dict[str, limits.typing.Any]) -> None:  # type: ignore[explicit-any]
         self.__dict__.update(state)
         self.timer = None
+        self._state_lock = None
         self.locks = defaultdict(asyncio.Lock)
         asyncio.ensure_future(self.__schedule_expiry())
 
@@ -78,11 +106,14 @@ class MemoryStorage(
                         self.events.pop(key, None)
                         self.locks.pop(key, None)
 
-            for key in list(self.expirations.keys()):
-                if self.expirations[key] <= time.time():
-                    self.storage.pop(key, None)
-                    self.expirations.pop(key, None)
-                    self.locks.pop(key, None)
+            if not self._custom_clock:
+                now = time.time()
+                async with await self._get_state_lock():
+                    for key in list(self.expirations.keys()):
+                        if self.expirations.get(key, inf) <= now:
+                            self.storage.pop(key, None)
+                            self.expirations.pop(key, None)
+                            self.locks.pop(key, None)
         except asyncio.CancelledError:
             return
 
@@ -106,10 +137,11 @@ class MemoryStorage(
         """
         await self.get(key)
         await self.__schedule_expiry()
-        async with self.locks[key]:
+        async with await self._get_state_lock(), self.locks[key]:
+            await self._get_locked(key, self.clock())
             self.storage[key] += amount
             if self.storage[key] == amount:
-                self.expirations[key] = time.time() + expiry
+                self.expirations[key] = self.clock() + expiry
         return self.storage.get(key, amount)
 
     async def decr(self, key: str, amount: int = 1) -> int:
@@ -120,7 +152,7 @@ class MemoryStorage(
         """
         await self.get(key)
         await self.__schedule_expiry()
-        async with self.locks[key]:
+        async with await self._get_state_lock(), self.locks[key]:
             self.storage[key] = max(self.storage[key] - amount, 0)
 
         return self.storage.get(key, amount)
@@ -129,10 +161,8 @@ class MemoryStorage(
         """
         :param key: the key to get the counter value for
         """
-        if self.expirations.get(key, 0) <= time.time():
-            self.storage.pop(key, None)
-            self.expirations.pop(key, None)
-            self.locks.pop(key, None)
+        async with await self._get_state_lock():
+            await self._get_locked(key, self.clock())
 
         return self.storage.get(key, 0)
 
@@ -140,10 +170,11 @@ class MemoryStorage(
         """
         :param key: the key to clear rate limits for
         """
-        self.storage.pop(key, None)
-        self.expirations.pop(key, None)
-        self.events.pop(key, None)
-        self.locks.pop(key, None)
+        async with await self._get_state_lock(), self.locks[key]:
+            self.storage.pop(key, None)
+            self.expirations.pop(key, None)
+            self.events.pop(key, None)
+            self.locks.pop(key, None)
 
     async def acquire_entry(
         self, key: str, limit: int, expiry: int, amount: int = 1
@@ -177,7 +208,8 @@ class MemoryStorage(
         :param key: the key to get the expiry for
         """
 
-        return self.expirations.get(key, time.time())
+        async with await self._get_state_lock():
+            return self.expirations.get(key, self.clock())
 
     async def get_moving_window(
         self, key: str, limit: int, expiry: int
@@ -208,7 +240,19 @@ class MemoryStorage(
     ) -> bool:
         if amount > limit:
             return False
-        now = time.time()
+        async with await self._get_state_lock():
+            return await self._acquire_sliding_window_entry_locked(
+                key, limit, expiry, amount, self.clock()
+            )
+
+    async def _acquire_sliding_window_entry_locked(
+        self,
+        key: str,
+        limit: int,
+        expiry: int,
+        amount: int,
+        now: float,
+    ) -> bool:
         previous_key, current_key = self.sliding_window_keys(key, expiry, now)
         (
             previous_count,
@@ -222,27 +266,33 @@ class MemoryStorage(
         else:
             # Hit, increase the current counter.
             # If the counter doesn't exist yet, set twice the theorical expiry.
-            current_count = await self.incr(current_key, 2 * expiry, amount=amount)
+            self.storage[current_key] += amount
+            if self.storage[current_key] == amount:
+                self.expirations[current_key] = now + 2 * expiry
+            current_count = self.storage[current_key]
             weighted_count = previous_count * previous_ttl / expiry + current_count
             if floor(weighted_count) > limit:
                 # Another hit won the race condition: revert the incrementation and refuse this hit
                 # Limitation: during high concurrency at the end of the window,
                 # the counter is shifted and cannot be decremented, so less requests than expected are allowed.
-                await self.decr(current_key, amount)
+                self.storage[current_key] = max(
+                    self.storage[current_key] - amount, 0
+                )
                 return False
             return True
 
     async def get_sliding_window(
         self, key: str, expiry: int
     ) -> tuple[int, float, int, float]:
-        now = time.time()
-        previous_key, current_key = self.sliding_window_keys(key, expiry, now)
-        return await self._get_sliding_window_info(
-            previous_key, current_key, expiry, now
-        )
+        async with await self._get_state_lock():
+            now = self.clock()
+            previous_key, current_key = self.sliding_window_keys(key, expiry, now)
+            return await self._get_sliding_window_info(
+                previous_key, current_key, expiry, now
+            )
 
     async def clear_sliding_window(self, key: str, expiry: int) -> None:
-        now = time.time()
+        now = self.clock()
         previous_key, current_key = self.sliding_window_keys(key, expiry, now)
         await self.clear(current_key)
         await self.clear(previous_key)
@@ -254,14 +304,21 @@ class MemoryStorage(
         expiry: int,
         now: float,
     ) -> tuple[int, float, int, float]:
-        previous_count = await self.get(previous_key)
-        current_count = await self.get(current_key)
+        previous_count = await self._get_locked(previous_key, now)
+        current_count = await self._get_locked(current_key, now)
         if previous_count == 0:
             previous_ttl = float(0)
         else:
             previous_ttl = (1 - (((now - expiry) / expiry) % 1)) * expiry
         current_ttl = (1 - ((now / expiry) % 1)) * expiry + expiry
         return previous_count, previous_ttl, current_count, current_ttl
+
+    async def _get_locked(self, key: str, now: float) -> int:
+        if self.expirations.get(key, 0) <= now:
+            self.storage.pop(key, None)
+            self.expirations.pop(key, None)
+            self.locks.pop(key, None)
+        return self.storage.get(key, 0)
 
     async def check(self) -> bool:
         """
@@ -271,13 +328,95 @@ class MemoryStorage(
         return True
 
     async def reset(self) -> int | None:
-        num_items = max(len(self.storage), len(self.events))
-        self.storage.clear()
-        self.expirations.clear()
-        self.events.clear()
-        self.locks.clear()
+        async with await self._get_state_lock():
+            num_items = max(len(self.storage), len(self.events))
+            self.storage.clear()
+            self.expirations.clear()
+            self.events.clear()
+            self.locks.clear()
 
         return num_items
+
+    async def acquire_many(
+        self, requests: Sequence[CombinedRateLimitRequest]
+    ) -> CombinedRateLimitResult:
+        now = self.clock()
+        groups = prepare_combined_requests(requests, now)
+        rejected = []
+        retry_at = inf
+        await self.__schedule_expiry()
+
+        async with await self._get_state_lock():
+            snapshots = []
+            for group in groups:
+                if group.window == "fixed-window":
+                    current_count = await self._get_locked(group.key, now)
+                    snapshots.append((group, current_count, 0, 0.0))
+                    if current_count + group.cost > group.limit:
+                        rejected.extend(
+                            requests[index] for index in group.sources
+                        )
+                        retry_at = min(
+                            retry_at,
+                            fixed_window_retry_at(
+                                current_count,
+                                group.cost,
+                                group.limit,
+                                self.expirations.get(group.key, now),
+                            ),
+                        )
+                else:
+                    previous_key, current_key = self.sliding_window_keys(
+                        group.key, group.expiry, now
+                    )
+                    previous_count, previous_ttl, current_count, _ = (
+                        await self._get_sliding_window_info(
+                            previous_key, current_key, group.expiry, now
+                        )
+                    )
+                    snapshots.append(
+                        (group, 0, previous_count, previous_ttl, current_count)
+                    )
+                    weighted_count = (
+                        previous_count * previous_ttl / group.expiry + current_count
+                    )
+                    if floor(weighted_count) + group.cost > group.limit:
+                        rejected.extend(
+                            requests[index] for index in group.sources
+                        )
+                        retry_at = min(
+                            retry_at,
+                            sliding_window_retry_at(
+                                now,
+                                previous_count,
+                                previous_ttl,
+                                current_count,
+                                group.cost,
+                                group.limit,
+                                group.expiry,
+                            ),
+                        )
+
+            if rejected:
+                return CombinedRateLimitResult(False, tuple(rejected), retry_at)
+
+            for snapshot in snapshots:
+                group = snapshot[0]
+                if group.window == "fixed-window":
+                    current_count = snapshot[1]
+                    self.storage[group.key] = current_count + group.cost
+                    if current_count == 0:
+                        self.expirations[group.key] = now + group.expiry
+                else:
+                    _, _, _, _, current_count = snapshot
+                    _, current_key = self.sliding_window_keys(
+                        group.key, group.expiry, now
+                    )
+                    self.storage[current_key] = current_count + group.cost
+                    if current_count == 0:
+                        self.expirations[current_key] = now + 2 * group.expiry
+
+        return CombinedRateLimitResult(True, (), now)
 
     def __del__(self) -> None:
         try:

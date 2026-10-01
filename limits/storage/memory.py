@@ -4,10 +4,18 @@ import bisect
 import threading
 import time
 from collections import Counter, defaultdict
-from math import floor
+from math import floor, inf
 
+from limits.combined import (
+    CombinedRateLimitRequest,
+    CombinedRateLimitResult,
+    fixed_window_retry_at,
+    prepare_combined_requests,
+    sliding_window_retry_at,
+)
 import limits.typing
 from limits.storage.base import (
+    CombinedWindowSupport,
     MovingWindowSupport,
     SlidingWindowCounterSupport,
     Storage,
@@ -22,7 +30,11 @@ class Entry:
 
 
 class MemoryStorage(
-    Storage, MovingWindowSupport, SlidingWindowCounterSupport, TimestampedSlidingWindow
+    Storage,
+    MovingWindowSupport,
+    SlidingWindowCounterSupport,
+    CombinedWindowSupport,
+    TimestampedSlidingWindow,
 ):
     """
     rate limit storage using :class:`collections.Counter`
@@ -33,11 +45,20 @@ class MemoryStorage(
 
     STORAGE_SCHEME = ["memory"]
 
-    def __init__(self, uri: str | None = None, wrap_exceptions: bool = False, **_: str):
+    def __init__(
+        self,
+        uri: str | None = None,
+        wrap_exceptions: bool = False,
+        clock: limits.typing.Callable[[], float] | None = None,
+        **_: str,
+    ):
         self.storage: limits.typing.Counter[str] = Counter()
         self.locks: defaultdict[str, threading.RLock] = defaultdict(threading.RLock)
         self.expirations: dict[str, float] = {}
         self.events: dict[str, list[Entry]] = {}
+        self.clock = clock or time.time
+        self._custom_clock = clock is not None
+        self._state_lock = threading.RLock()
         self._timer_lock = threading.Lock()
         self.timer: threading.Timer = threading.Timer(0.01, self.__expire_events)
         self.timer.start()
@@ -48,12 +69,14 @@ class MemoryStorage(
         del state["timer"]
         del state["locks"]
         del state["_timer_lock"]
+        del state["_state_lock"]
         return state
 
     def __setstate__(self, state: dict[str, limits.typing.Any]) -> None:  # type: ignore[explicit-any]
         self.__dict__.update(state)
         self.locks = defaultdict(threading.RLock)
         self._timer_lock = threading.Lock()
+        self._state_lock = threading.RLock()
         self.timer = threading.Timer(0.01, self.__expire_events)
         self.timer.start()
 
@@ -67,11 +90,14 @@ class MemoryStorage(
                     self.events[key] = self.events[key][:oldest]
                 if not self.events.get(key, None):
                     self.locks.pop(key, None)
-        for key in list(self.expirations.keys()):
-            if self.expirations[key] <= time.time():
-                self.storage.pop(key, None)
-                self.expirations.pop(key, None)
-                self.locks.pop(key, None)
+        if not self._custom_clock:
+            now = time.time()
+            for key in list(self.expirations.keys()):
+                with self._state_lock:
+                    if self.expirations.get(key, inf) <= now:
+                        self.storage.pop(key, None)
+                        self.expirations.pop(key, None)
+                        self.locks.pop(key, None)
 
     def __schedule_expiry(self) -> None:
         with self._timer_lock:
@@ -95,10 +121,11 @@ class MemoryStorage(
         """
         self.get(key)
         self.__schedule_expiry()
-        with self.locks[key]:
+        with self._state_lock, self.locks[key]:
+            self.get(key)
             self.storage[key] += amount
             if self.storage[key] == amount:
-                self.expirations[key] = time.time() + expiry
+                self.expirations[key] = self.clock() + expiry
         return self.storage.get(key, 0)
 
     def decr(self, key: str, amount: int = 1) -> int:
@@ -110,7 +137,7 @@ class MemoryStorage(
         """
         self.get(key)
         self.__schedule_expiry()
-        with self.locks[key]:
+        with self._state_lock, self.locks[key]:
             self.storage[key] = max(self.storage[key] - amount, 0)
 
         return self.storage.get(key, 0)
@@ -120,10 +147,11 @@ class MemoryStorage(
         :param key: the key to get the counter value for
         """
 
-        if self.expirations.get(key, 0) <= time.time():
-            self.storage.pop(key, None)
-            self.expirations.pop(key, None)
-            self.locks.pop(key, None)
+        with self._state_lock:
+            if self.expirations.get(key, 0) <= self.clock():
+                self.storage.pop(key, None)
+                self.expirations.pop(key, None)
+                self.locks.pop(key, None)
 
         return self.storage.get(key, 0)
 
@@ -131,10 +159,11 @@ class MemoryStorage(
         """
         :param key: the key to clear rate limits for
         """
-        self.storage.pop(key, None)
-        self.expirations.pop(key, None)
-        self.events.pop(key, None)
-        self.locks.pop(key, None)
+        with self._state_lock, self.locks[key]:
+            self.storage.pop(key, None)
+            self.expirations.pop(key, None)
+            self.events.pop(key, None)
+            self.locks.pop(key, None)
 
     def acquire_entry(self, key: str, limit: int, expiry: int, amount: int = 1) -> bool:
         """
@@ -166,7 +195,8 @@ class MemoryStorage(
         :param key: the key to get the expiry for
         """
 
-        return self.expirations.get(key, time.time())
+        with self._state_lock:
+            return self.expirations.get(key, self.clock())
 
     def get_moving_window(self, key: str, limit: int, expiry: int) -> tuple[float, int]:
         """
@@ -194,7 +224,19 @@ class MemoryStorage(
     ) -> bool:
         if amount > limit:
             return False
-        now = time.time()
+        with self._state_lock:
+            return self._acquire_sliding_window_entry_locked(
+                key, limit, expiry, amount, self.clock()
+            )
+
+    def _acquire_sliding_window_entry_locked(
+        self,
+        key: str,
+        limit: int,
+        expiry: int,
+        amount: int,
+        now: float,
+    ) -> bool:
         previous_key, current_key = self.sliding_window_keys(key, expiry, now)
         (
             previous_count,
@@ -208,13 +250,16 @@ class MemoryStorage(
         else:
             # Hit, increase the current counter.
             # If the counter doesn't exist yet, set twice the theorical expiry.
-            current_count = self.incr(current_key, 2 * expiry, amount=amount)
+            self.storage[current_key] += amount
+            if self.storage[current_key] == amount:
+                self.expirations[current_key] = now + 2 * expiry
+            current_count = self.storage[current_key]
             weighted_count = previous_count * previous_ttl / expiry + current_count
             if floor(weighted_count) > limit:
                 # Another hit won the race condition: revert the incrementation and refuse this hit
                 # Limitation: during high concurrency at the end of the window,
                 # the counter is shifted and cannot be decremented, so less requests than expected are allowed.
-                self.decr(current_key, amount)
+                self.storage[current_key] = max(self.storage[current_key] - amount, 0)
                 return False
             return True
 
@@ -225,8 +270,8 @@ class MemoryStorage(
         expiry: int,
         now: float,
     ) -> tuple[int, float, int, float]:
-        previous_count = self.get(previous_key)
-        current_count = self.get(current_key)
+        previous_count = self._get_locked(previous_key, now)
+        current_count = self._get_locked(current_key, now)
         if previous_count == 0:
             previous_ttl = float(0)
         else:
@@ -234,15 +279,22 @@ class MemoryStorage(
         current_ttl = (1 - ((now / expiry) % 1)) * expiry + expiry
         return previous_count, previous_ttl, current_count, current_ttl
 
+    def _get_locked(self, key: str, now: float) -> int:
+        if self.expirations.get(key, 0) <= now:
+            self.storage.pop(key, None)
+            self.expirations.pop(key, None)
+            self.locks.pop(key, None)
+        return self.storage.get(key, 0)
+
     def get_sliding_window(
         self, key: str, expiry: int
     ) -> tuple[int, float, int, float]:
-        now = time.time()
+        now = self.clock()
         previous_key, current_key = self.sliding_window_keys(key, expiry, now)
         return self._get_sliding_window_info(previous_key, current_key, expiry, now)
 
     def clear_sliding_window(self, key: str, expiry: int) -> None:
-        now = time.time()
+        now = self.clock()
         previous_key, current_key = self.sliding_window_keys(key, expiry, now)
         self.clear(previous_key)
         self.clear(current_key)
@@ -255,9 +307,89 @@ class MemoryStorage(
         return True
 
     def reset(self) -> int | None:
-        num_items = max(len(self.storage), len(self.events))
-        self.storage.clear()
-        self.expirations.clear()
-        self.events.clear()
-        self.locks.clear()
+        with self._state_lock:
+            num_items = max(len(self.storage), len(self.events))
+            self.storage.clear()
+            self.expirations.clear()
+            self.events.clear()
+            self.locks.clear()
         return num_items
+
+    def acquire_many(
+        self,
+        requests: limits.typing.Sequence[CombinedRateLimitRequest],
+    ) -> CombinedRateLimitResult:
+        now = self.clock()
+        groups = prepare_combined_requests(requests, now)
+        rejected = []
+        retry_at = inf
+        self.__schedule_expiry()
+
+        with self._state_lock:
+            snapshots = []
+            for group in groups:
+                if group.window == "fixed-window":
+                    current_count = self._get_locked(group.key, now)
+                    snapshots.append((group, current_count, 0, 0.0))
+                    if current_count + group.cost > group.limit:
+                        rejected.extend((requests[index] for index in group.sources))
+                        expiry = self.expirations.get(group.key, now)
+                        retry_at = min(
+                            retry_at,
+                            fixed_window_retry_at(
+                                current_count,
+                                group.cost,
+                                group.limit,
+                                expiry,
+                            ),
+                        )
+                else:
+                    previous_key, current_key = self.sliding_window_keys(
+                        group.key, group.expiry, now
+                    )
+                    previous_count, previous_ttl, current_count, _ = (
+                        self._get_sliding_window_info(
+                            previous_key, current_key, group.expiry, now
+                        )
+                    )
+                    snapshots.append(
+                        (group, 0, previous_count, previous_ttl, current_count)
+                    )
+                    weighted_count = (
+                        previous_count * previous_ttl / group.expiry + current_count
+                    )
+                    if floor(weighted_count) + group.cost > group.limit:
+                        rejected.extend((requests[index] for index in group.sources))
+                        retry_at = min(
+                            retry_at,
+                            sliding_window_retry_at(
+                                now,
+                                previous_count,
+                                previous_ttl,
+                                current_count,
+                                group.cost,
+                                group.limit,
+                                group.expiry,
+                            ),
+                        )
+
+            if rejected:
+                return CombinedRateLimitResult(False, tuple(rejected), retry_at)
+
+            for snapshot in snapshots:
+                group = snapshot[0]
+                if group.window == "fixed-window":
+                    current_count = snapshot[1]
+                    self.storage[group.key] = current_count + group.cost
+                    if current_count == 0:
+                        self.expirations[group.key] = now + group.expiry
+                else:
+                    _, _, _, _, current_count = snapshot
+                    previous_key, current_key = self.sliding_window_keys(
+                        group.key, group.expiry, now
+                    )
+                    self.storage[current_key] = current_count + group.cost
+                    if current_count == 0:
+                        self.expirations[current_key] = now + 2 * group.expiry
+
+        return CombinedRateLimitResult(True, (), now)

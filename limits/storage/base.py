@@ -10,9 +10,15 @@ from limits.typing import (
     Callable,
     P,
     R,
+    TYPE_CHECKING,
     cast,
 )
 from limits.util import LazyDependency
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from limits.combined import CombinedRateLimitRequest, CombinedRateLimitResult
 
 
 def _wrap_errors(
@@ -220,6 +226,25 @@ class SlidingWindowCounterSupport(ABC):
         :param expiry: the rate limit expiry, needed to compute the key in some implemenations
         """
         ...
+
+
+class CombinedWindowSupport(ABC):
+    """Storage backends that can atomically consume a group of window counters."""
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:  # type: ignore[explicit-any]
+        for method in {"acquire_many"}:
+            setattr(
+                cls,
+                method,
+                _wrap_errors(getattr(cls, method)),
+            )
+        super().__init_subclass__(**kwargs)
+
+    @abstractmethod
+    def acquire_many(
+        self, requests: "Sequence[CombinedRateLimitRequest]"
+    ) -> "CombinedRateLimitResult":
+        raise NotImplementedError
 
 
 class TimestampedSlidingWindow:
