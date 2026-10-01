@@ -45,6 +45,35 @@ class WindowStats(NamedTuple):
     remaining: int
 
 
+@dataclasses.dataclass(frozen=True)
+class Lease:
+    """
+    Opaque handle representing a reservation made against a rate limit.
+
+    A lease is returned by
+    :meth:`limits.strategies.FixedWindowRateLimiter.reserve` and can later be
+    settled exactly once with either
+    :meth:`limits.strategies.FixedWindowRateLimiter.commit` (to account for the
+    actual cost) or :meth:`limits.strategies.FixedWindowRateLimiter.cancel`
+    (to release the reservation).
+
+    The handle binds the rate limit key, the window generation it was
+    issued in, the reserved amount and the moment it expires. Callers should
+    treat it as an opaque token and not rely on its fields.
+    """
+
+    #: Unique identifier of the lease
+    lease_id: str
+    #: The rate limit key the reservation was made against
+    key: str
+    #: The amount that was reserved
+    amount: int
+    #: Time as seconds since the Epoch when this lease expires
+    expires_at: float
+    #: The generation of the window the reservation was made in
+    generation: int
+
+
 @dataclasses.dataclass
 class Dependency:
     name: str

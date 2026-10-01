@@ -15,7 +15,7 @@ from limits.typing import (
     R,
     cast,
 )
-from limits.util import LazyDependency
+from limits.util import LazyDependency, Lease
 
 
 def _wrap_errors(
@@ -232,3 +232,82 @@ class SlidingWindowCounterSupport(ABC):
         :param expiry: the rate limit expiry, needed to compute the key in some implemenations
         """
         ...
+
+
+class ReservationSupport(ABC):
+    """
+    Abstract base class for async storages that support
+    reserve / commit / cancel reservations for the
+    :ref:`strategies:fixed window` strategy.
+    """
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:  # type: ignore[explicit-any]
+        for method in {
+            "reserve",
+            "commit",
+            "cancel",
+        }:
+            setattr(
+                cls,
+                method,
+                _wrap_errors(getattr(cls, method)),
+            )
+        super().__init_subclass__(**kwargs)
+
+    @abstractmethod
+    async def reserve(
+        self,
+        key: str,
+        limit: int,
+        expiry: int,
+        amount: int = 1,
+        lease_ttl: float | None = None,
+    ) -> Lease | None:
+        """
+        Reserve ``amount`` against the current window for ``key``,
+        returning a lease that must later be settled with either
+        :meth:`commit` or :meth:`cancel`.
+
+        :param key: rate limit key to reserve against
+        :param limit: amount of entries allowed
+        :param expiry: expiry of the window
+        :param amount: the amount to reserve
+        :param lease_ttl: how many seconds the lease remains valid for.
+         Defaults to ``expiry``.
+        :return: the lease, or ``None`` if the reservation could not be made
+         without exceeding ``limit``
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def commit(self, lease: Lease, cost: int) -> None:
+        """
+        Settle ``lease`` with the actual ``cost`` consumed, releasing the
+        unconsumed remainder of the reservation.
+
+        Committing the same lease again with the same cost is a no-op;
+        committing it with a different cost raises
+        :exc:`limits.errors.LeaseConflictError`.
+
+        :param lease: the lease to settle
+        :param cost: the actual cost, which must not exceed the reserved amount
+        :raise ValueError: if ``cost`` exceeds the reserved amount
+        :raise limits.errors.LeaseExpiredError: if the lease is no longer valid
+        :raise limits.errors.LeaseConflictError: if the lease was already
+         settled with a different outcome
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def cancel(self, lease: Lease) -> None:
+        """
+        Release the reservation held by ``lease``, returning the reserved
+        amount to the window it was taken from. Cancelling is idempotent,
+        and a cancel arriving after the window moved on or the lease expired
+        does not credit the new window.
+
+        :param lease: the lease to release
+        :raise limits.errors.LeaseConflictError: if the lease was already
+         committed
+        """
+        raise NotImplementedError

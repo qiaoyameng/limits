@@ -14,9 +14,10 @@ from .limits import (
     RateLimitItemPerSecond,
     RateLimitItemPerYear,
 )
-from .util import WindowStats, parse, parse_many
+from .util import Lease, WindowStats, parse, parse_many
 
 __all__ = [
+    "Lease",
     "RateLimitItem",
     "RateLimitItemPerDay",
     "RateLimitItemPerHour",

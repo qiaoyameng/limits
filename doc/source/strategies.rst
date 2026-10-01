@@ -40,6 +40,36 @@ For example, with a rate limit of 10 requests per minute:
    with large windows with finer-granularity ones
    (e.g., combine a 2 requests per second limit with a 10 requests per minute limit).
 
+Reservations
+------------
+
+When the cost of an operation is only known after it completes, the fixed window
+strategy supports a two-phase *reserve / commit / cancel* flow instead of a plain
+:meth:`~limits.strategies.FixedWindowRateLimiter.hit`:
+
+- :meth:`~limits.strategies.FixedWindowRateLimiter.reserve` deducts an estimated
+  (upper bound) cost from the current window and returns an opaque
+  :class:`~limits.Lease`, or ``None`` if the reservation would exceed the limit.
+  The lease is bound to the rate limit key, the current window generation, the
+  reserved amount and an expiry time (``ttl``, defaulting to the window expiry).
+- :meth:`~limits.strategies.FixedWindowRateLimiter.commit` settles the lease with
+  the *actual* cost (which must not exceed the reserved amount) and releases the
+  unconsumed remainder. Committing the same lease again with the same cost is a
+  no-op; committing it with a different cost raises
+  :exc:`limits.errors.LeaseConflictError`.
+- :meth:`~limits.strategies.FixedWindowRateLimiter.cancel` releases the
+  reservation, returning it to the window it was taken from. A cancel arriving
+  after the window has moved on or the lease has expired does not credit the
+  new window.
+
+Leases that are never settled are released automatically once their ``ttl``
+elapses, and settling a lease after its window was reset raises
+:exc:`limits.errors.LeaseExpiredError`.
+
+Reservations are currently only supported by the in-memory storages
+(``memory://`` and ``async+memory://``); other strategies and storages raise
+``NotImplementedError``.
+
 
 Moving Window
 =============
@@ -129,6 +159,5 @@ Suppose:
    clock intervals), while others adjust buckets dynamically based on the first hit.
    This difference can allow an attacker to bypass limits during the initial sampling
    period. The affected implementations are ``memcached`` and ``in-memory``.
-
 
 

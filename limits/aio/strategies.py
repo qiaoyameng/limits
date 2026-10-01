@@ -13,9 +13,9 @@ from deprecated.sphinx import versionadded
 from ..limits import RateLimitItem
 from ..storage import StorageTypes
 from ..typing import cast
-from ..util import WindowStats
+from ..util import Lease, WindowStats
 from .storage import MovingWindowSupport, Storage
-from .storage.base import SlidingWindowCounterSupport
+from .storage.base import ReservationSupport, SlidingWindowCounterSupport
 
 
 class RateLimiter(ABC):
@@ -67,6 +67,48 @@ class RateLimiter(ABC):
 
     async def clear(self, item: RateLimitItem, *identifiers: str) -> None:
         return await self.storage.clear(item.key_for(*identifiers))
+
+    async def reserve(
+        self,
+        item: RateLimitItem,
+        *identifiers: str,
+        cost: int = 1,
+        ttl: float | None = None,
+    ) -> Lease | None:
+        """
+        Reserve ``cost`` against the rate limit, to be settled later with
+        either :meth:`commit` or :meth:`cancel`.
+
+        :param item: the rate limit item
+        :param identifiers: variable list of strings to uniquely identify the
+         limit
+        :param cost: The amount to reserve, default 1
+        :param ttl: How many seconds the reservation remains valid for.
+         Defaults to the expiry of ``item``.
+
+        :return: a lease for the reservation, or None if the reservation
+         could not be made without exceeding the limit
+        """
+        raise NotImplementedError(f"{self.__class__} does not support reservations")
+
+    async def commit(self, lease: Lease, cost: int) -> None:
+        """
+        Settle a reservation with its actual cost, releasing the unconsumed
+        remainder of the reservation.
+
+        :param lease: The lease returned by :meth:`reserve`
+        :param cost: The actual cost, which must not exceed the reserved amount
+        """
+        raise NotImplementedError(f"{self.__class__} does not support reservations")
+
+    async def cancel(self, lease: Lease) -> None:
+        """
+        Release a reservation, returning the reserved amount to the window
+        it was taken from.
+
+        :param lease: The lease returned by :meth:`reserve`
+        """
+        raise NotImplementedError(f"{self.__class__} does not support reservations")
 
 
 class MovingWindowRateLimiter(RateLimiter):
@@ -143,6 +185,71 @@ class FixedWindowRateLimiter(RateLimiter):
     """
     Reference: :ref:`strategies:fixed window`
     """
+
+    def _reservation_storage(self) -> ReservationSupport:
+        if not all(
+            hasattr(self.storage, method) for method in ("reserve", "commit", "cancel")
+        ):
+            raise NotImplementedError(
+                "Reservations are not implemented for storage "
+                f"of type {self.storage.__class__}"
+            )
+        return cast(ReservationSupport, self.storage)
+
+    async def reserve(
+        self,
+        item: RateLimitItem,
+        *identifiers: str,
+        cost: int = 1,
+        ttl: float | None = None,
+    ) -> Lease | None:
+        """
+        Reserve ``cost`` against the rate limit, to be settled later with
+        either :meth:`commit` or :meth:`cancel`.
+
+        :param item: the rate limit item
+        :param identifiers: variable list of strings to uniquely identify the
+         limit
+        :param cost: The amount to reserve, default 1
+        :param ttl: How many seconds the reservation remains valid for.
+         Defaults to the expiry of ``item``.
+
+        :return: a lease for the reservation, or None if the reservation
+         could not be made without exceeding the limit
+        """
+        return await self._reservation_storage().reserve(
+            item.key_for(*identifiers),
+            item.amount,
+            item.get_expiry(),
+            amount=cost,
+            lease_ttl=ttl,
+        )
+
+    async def commit(self, lease: Lease, cost: int) -> None:
+        """
+        Settle a reservation with its actual cost, releasing the unconsumed
+        remainder of the reservation.
+
+        Committing the same lease again with the same cost is a no-op;
+        committing it with a different cost raises
+        :exc:`limits.errors.LeaseConflictError`.
+
+        :param lease: The lease returned by :meth:`reserve`
+        :param cost: The actual cost, which must not exceed the reserved amount
+        """
+        if cost > lease.amount:
+            raise ValueError(f"cost {cost} exceeds the reserved amount {lease.amount}")
+        await self._reservation_storage().commit(lease, cost)
+
+    async def cancel(self, lease: Lease) -> None:
+        """
+        Release a reservation, returning the reserved amount to the window
+        it was taken from. A cancel arriving after the window moved on or
+        the lease expired does not credit the new window.
+
+        :param lease: The lease returned by :meth:`reserve`
+        """
+        await self._reservation_storage().cancel(lease)
 
     async def hit(self, item: RateLimitItem, *identifiers: str, cost: int = 1) -> bool:
         """

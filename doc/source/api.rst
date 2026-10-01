@@ -143,6 +143,7 @@ Abstract storage classes
 .. autoclass:: limits.storage.Storage
 .. autoclass:: limits.storage.MovingWindowSupport
 .. autoclass:: limits.storage.SlidingWindowCounterSupport
+.. autoclass:: limits.storage.ReservationSupport
 
 
 Async Abstract storage classes
@@ -151,6 +152,7 @@ Async Abstract storage classes
 .. autoclass:: limits.aio.storage.Storage
 .. autoclass:: limits.aio.storage.MovingWindowSupport
 .. autoclass:: limits.aio.storage.SlidingWindowCounterSupport
+.. autoclass:: limits.aio.storage.ReservationSupport
 
 
 Rate Limits
@@ -187,6 +189,8 @@ Structures
 ==========
 .. autoclass:: limits.WindowStats
    :no-inherited-members:
+.. autoclass:: limits.Lease
+   :no-inherited-members:
 
 
 Exceptions
@@ -196,4 +200,10 @@ Exceptions
 .. autoexception:: limits.errors.ConcurrentUpdateError
    :no-inherited-members:
 .. autoexception:: limits.errors.StorageError
+   :no-inherited-members:
+.. autoexception:: limits.errors.ReservationError
+   :no-inherited-members:
+.. autoexception:: limits.errors.LeaseExpiredError
+   :no-inherited-members:
+.. autoexception:: limits.errors.LeaseConflictError
    :no-inherited-members:
