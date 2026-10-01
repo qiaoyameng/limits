@@ -4,9 +4,16 @@ import bisect
 import threading
 import time
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from math import floor
 
 import limits.typing
+from limits.storage._snapshot import (
+    dump_snapshot,
+    load_snapshot,
+    matches_namespace,
+    validate_namespaces,
+)
 from limits.storage.base import (
     MovingWindowSupport,
     SlidingWindowCounterSupport,
@@ -16,8 +23,8 @@ from limits.storage.base import (
 
 
 class Entry:
-    def __init__(self, expiry: float) -> None:
-        self.atime = time.time()
+    def __init__(self, expiry: float, atime: float | None = None) -> None:
+        self.atime = time.time() if atime is None else atime
         self.expiry = self.atime + expiry
 
 
@@ -253,6 +260,83 @@ class MemoryStorage(
         """
 
         return True
+
+    def export_snapshot(self) -> dict[str, limits.typing.Any]:  # type: ignore[explicit-any]
+        """
+        Export the remaining quota of this storage as a versioned,
+        JSON-serializable snapshot covering the fixed, moving and sliding
+        window state.
+
+        All times are expressed relative to the moment of the export
+        (remaining durations and entry ages), so the snapshot does not
+        depend on the clock origin of this process and never contains
+        locks, timers or other live objects.
+
+        :return: a plain mapping that can be serialized with
+         :mod:`json` and later passed to :meth:`import_snapshot`
+        """
+        now = time.time()
+        return dump_snapshot(
+            list(self.storage.items()),
+            dict(self.expirations),
+            [
+                (key, [(entry.atime, entry.expiry) for entry in entries])
+                for key, entries in self.events.items()
+            ],
+            now,
+        )
+
+    def import_snapshot(
+        self,
+        snapshot: dict[str, limits.typing.Any] | str | bytes,  # type: ignore[explicit-any]
+        *,
+        elapsed: float = 0.0,
+        namespaces: Iterable[str] | None = None,
+    ) -> None:
+        """
+        Import a snapshot previously created with :meth:`export_snapshot`.
+
+        The snapshot is fully validated before anything is applied: a
+        malformed or unsupported snapshot raises
+        :exc:`limits.errors.SnapshotError` and leaves the
+        current state untouched. When validation succeeds the state is
+        applied in a single pass.
+
+        :param snapshot: the snapshot as a mapping or JSON encoded
+         string/bytes
+        :param elapsed: the offline time in seconds between the export
+         and this import. Entries that expired while offline are dropped
+         instead of being resurrected.
+        :param namespaces: when provided, only the state of these
+         namespaces is replaced by the snapshot content and the rest of
+         the current state is left untouched. When ``None`` (default)
+         the whole storage is replaced.
+        """
+        counters, expirations, events = load_snapshot(
+            snapshot, elapsed=elapsed, namespaces=namespaces, now=time.time()
+        )
+        selected = validate_namespaces(namespaces)
+
+        if selected is None:
+            self.storage.clear()
+            self.expirations.clear()
+            self.events.clear()
+        else:
+            for key in [
+                key
+                for key in set(self.storage) | set(self.expirations) | set(self.events)
+                if matches_namespace(key, selected)
+            ]:
+                self.storage.pop(key, None)
+                self.expirations.pop(key, None)
+                self.events.pop(key, None)
+
+        self.storage.update(counters)
+        self.expirations.update(expirations)
+        for key, entries in events.items():
+            self.events[key] = [
+                Entry(expiry - atime, atime=atime) for atime, expiry in entries
+            ]
 
     def reset(self) -> int | None:
         num_items = max(len(self.storage), len(self.events))

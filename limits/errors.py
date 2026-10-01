@@ -28,3 +28,10 @@ class StorageError(Exception):
 
     def __init__(self, storage_error: Exception) -> None:
         self.storage_error = storage_error
+
+
+class SnapshotError(ValueError):
+    """
+    Error raised when a storage snapshot is malformed, fails
+    validation or uses an unsupported version
+    """

@@ -18,6 +18,23 @@ ASYNC_MEMCACHED_IMPLEMENTATION = os.environ.get(
 )
 
 
+class FakeClock:
+    """
+    A controllable replacement for the ``time`` module of a storage,
+    allowing tests to simulate restarts and the passage of time without
+    sleeping or rebooting a process.
+    """
+
+    def __init__(self, now: float = 0.0) -> None:
+        self._now = now
+
+    def time(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
 def fixed_start(fn):
     @functools.wraps(fn)
     def __inner(*a, **k):
