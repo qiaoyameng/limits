@@ -132,6 +132,18 @@ In-Memory Storage
 -----------------
 The in-memory storage (:class:`~limits.storage.MemoryStorage`) takes no parameters so the only relevant value is :code:`memory://`
 
+The state of an in-memory storage (fixed window counters, sliding window
+counters and moving window entries alike) can be exported as a versioned,
+JSON-serializable snapshot with
+:meth:`~limits.storage.MemoryStorage.export_snapshot` and re-applied after a
+restart with :meth:`~limits.storage.MemoryStorage.import_snapshot`. Timestamps
+in the snapshot are relative to the moment of the export, so the importing
+process -- whose clock origin may be entirely different -- must explicitly
+provide the time elapsed while the snapshot was offline. Entries that expired
+in the meantime are dropped instead of being revived. The same format is
+shared with the async in-memory storage
+(:class:`~limits.aio.storage.MemoryStorage`).
+
 Memcached Storage
 -----------------
 

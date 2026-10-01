@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 from math import floor
 
 import limits.typing
+from limits.storage import _snapshot
 from limits.storage.base import (
     MovingWindowSupport,
     SlidingWindowCounterSupport,
@@ -19,6 +20,17 @@ class Entry:
     def __init__(self, expiry: float) -> None:
         self.atime = time.time()
         self.expiry = self.atime + expiry
+
+    @classmethod
+    def restore(cls, atime: float, expiry: float) -> Entry:
+        """
+        Recreate an entry with explicit absolute timestamps, as
+        translated from a snapshot by the importing process.
+        """
+        entry = cls.__new__(cls)
+        entry.atime = atime
+        entry.expiry = expiry
+        return entry
 
 
 class MemoryStorage(
@@ -38,6 +50,7 @@ class MemoryStorage(
         self.locks: defaultdict[str, threading.RLock] = defaultdict(threading.RLock)
         self.expirations: dict[str, float] = {}
         self.events: dict[str, list[Entry]] = {}
+        self._state_lock = threading.Lock()
         self._timer_lock = threading.Lock()
         self.timer: threading.Timer = threading.Timer(0.01, self.__expire_events)
         self.timer.start()
@@ -47,12 +60,14 @@ class MemoryStorage(
         state = self.__dict__.copy()
         del state["timer"]
         del state["locks"]
+        del state["_state_lock"]
         del state["_timer_lock"]
         return state
 
     def __setstate__(self, state: dict[str, limits.typing.Any]) -> None:  # type: ignore[explicit-any]
         self.__dict__.update(state)
         self.locks = defaultdict(threading.RLock)
+        self._state_lock = threading.Lock()
         self._timer_lock = threading.Lock()
         self.timer = threading.Timer(0.01, self.__expire_events)
         self.timer.start()
@@ -253,6 +268,76 @@ class MemoryStorage(
         """
 
         return True
+
+    def export_snapshot(self) -> dict[str, limits.typing.Any]:  # type: ignore[explicit-any]
+        """
+        Export the current state of this storage as a versioned,
+        JSON-serializable snapshot that can be transferred to another
+        process and imported with :meth:`import_snapshot`.
+
+        All timestamps are expressed relative to the moment of the
+        export (remaining time to live for counters, age for moving
+        window entries) so the snapshot does not depend on the clock
+        origin of this process. Already expired entries are pruned.
+        """
+        with self._state_lock:
+            return _snapshot.export_snapshot(
+                time.time(), self.storage, self.expirations, self.events
+            )
+
+    def import_snapshot(
+        self,
+        snapshot: dict[str, limits.typing.Any],  # type: ignore[explicit-any]
+        *,
+        elapsed: float,
+        namespace: str | None = None,
+    ) -> None:
+        """
+        Replace the state of this storage with the contents of a
+        snapshot produced by :meth:`export_snapshot`.
+
+        The snapshot is fully validated before anything is applied: a
+        corrupt snapshot raises :exc:`limits.errors.SnapshotError` and
+        leaves the current state untouched.
+
+        :param snapshot: the snapshot document to import
+        :param elapsed: seconds elapsed between the export and this
+         import, used to fast-forward the relative timestamps of the
+         snapshot onto this process's clock. Entries that expired while
+         the snapshot was offline are dropped instead of being revived.
+        :param namespace: when provided, only the records of this
+         namespace are imported and only the existing keys of this
+         namespace are replaced; all other keys are left untouched.
+        """
+        counters, events = _snapshot.plan_import(
+            snapshot, time.time(), elapsed, namespace
+        )
+        with self._state_lock:
+            if namespace is None:
+                self.storage.clear()
+                self.expirations.clear()
+                self.events.clear()
+            else:
+                for key in [
+                    key
+                    for key in self.expirations
+                    if _snapshot.namespace_of(key) == namespace
+                ]:
+                    self.storage.pop(key, None)
+                    self.expirations.pop(key, None)
+                for key in [
+                    key
+                    for key in self.events
+                    if _snapshot.namespace_of(key) == namespace
+                ]:
+                    self.events.pop(key, None)
+            for key, (value, expiry) in counters.items():
+                self.storage[key] = value
+                self.expirations[key] = expiry
+            for key, entries in events.items():
+                self.events[key] = [
+                    Entry.restore(atime, expiry) for atime, expiry in entries
+                ]
 
     def reset(self) -> int | None:
         num_items = max(len(self.storage), len(self.events))
