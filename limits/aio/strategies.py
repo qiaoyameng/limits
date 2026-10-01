@@ -6,16 +6,24 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from math import floor, inf
 
 from deprecated.sphinx import versionadded
 
+from limits.combined import (
+    CombinedRateLimitRejection,
+    CombinedRateLimitRequest,
+    CombinedRateLimitResult,
+)
+from limits.typing import Any, cast
+
 from ..limits import RateLimitItem
 from ..storage import StorageTypes
-from ..typing import cast
 from ..util import WindowStats
 from .storage import MovingWindowSupport, Storage
 from .storage.base import SlidingWindowCounterSupport
+from .storage.memory import CombinedWindowRequest
 
 
 class RateLimiter(ABC):
@@ -67,6 +75,69 @@ class RateLimiter(ABC):
 
     async def clear(self, item: RateLimitItem, *identifiers: str) -> None:
         return await self.storage.clear(item.key_for(*identifiers))
+
+
+class CombinedRateLimiter:
+    """
+    Atomically consume multiple fixed-window or sliding-window-counter limits.
+    """
+
+    def __init__(self, storage: StorageTypes) -> None:
+        assert isinstance(storage, Storage)
+        if not hasattr(storage, "acquire_combined_entries"):
+            raise NotImplementedError(
+                "Combined rate limiting is not implemented for storage "
+                f"of type {storage.__class__}"
+            )
+        self.storage = storage
+
+    async def hit_many(
+        self, requests: Sequence[CombinedRateLimitRequest]
+    ) -> CombinedRateLimitResult:
+        if not requests:
+            raise ValueError("at least one rate limit request is required")
+        for request in requests:
+            if not isinstance(request, CombinedRateLimitRequest):
+                raise ValueError(
+                    "rate limit request must be a CombinedRateLimitRequest"
+                )
+            if request.strategy not in {"fixed-window", "sliding-window-counter"}:
+                raise ValueError(
+                    f"unsupported rate limit strategy: {request.strategy}"
+                )
+
+        storage_requests = [
+            CombinedWindowRequest(
+                request.item.key_for(*request.identifiers),
+                request.item.amount,
+                request.item.get_expiry(),
+                request.cost,
+                request.strategy,
+                index if request.source is None else request.source,
+            )
+            for index, request in enumerate(requests)
+        ]
+        result = await cast(Any, self.storage).acquire_combined_entries(
+            storage_requests
+        )
+        return CombinedRateLimitResult(
+            result.allowed,
+            tuple(
+                CombinedRateLimitRejection(
+                    rejection.source, rejection.key, rejection.retry_at
+                )
+                for rejection in result.rejected
+            ),
+            result.retry_at,
+        )
+
+    async def clear(self, request: CombinedRateLimitRequest) -> None:
+        if request.strategy == "sliding-window-counter":
+            await cast(Any, self.storage).clear_sliding_window(
+                request.item.key_for(*request.identifiers), request.item.get_expiry()
+            )
+        else:
+            await self.storage.clear(request.item.key_for(*request.identifiers))
 
 
 class MovingWindowRateLimiter(RateLimiter):

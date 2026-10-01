@@ -5,6 +5,11 @@ Rate limiting with commonly used storage backends
 from __future__ import annotations
 
 from . import _version, aio, storage, strategies
+from .combined import (
+    CombinedRateLimitRejection,
+    CombinedRateLimitRequest,
+    CombinedRateLimitResult,
+)
 from .limits import (
     RateLimitItem,
     RateLimitItemPerDay,
@@ -17,6 +22,9 @@ from .limits import (
 from .util import WindowStats, parse, parse_many
 
 __all__ = [
+    "CombinedRateLimitRejection",
+    "CombinedRateLimitRequest",
+    "CombinedRateLimitResult",
     "RateLimitItem",
     "RateLimitItemPerDay",
     "RateLimitItemPerHour",
