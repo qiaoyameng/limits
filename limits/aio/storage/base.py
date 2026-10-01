@@ -16,6 +16,7 @@ from limits.typing import (
     cast,
 )
 from limits.util import LazyDependency
+from limits.storage.base import Lease
 
 
 def _wrap_errors(
@@ -232,3 +233,68 @@ class SlidingWindowCounterSupport(ABC):
         :param expiry: the rate limit expiry, needed to compute the key in some implemenations
         """
         ...
+
+
+class ReservationSupport(ABC):
+    """
+    Abstract base class for async storages that support
+    reserve/commit/cancel semantics for the
+    :ref:`strategies:fixed window` strategy.
+
+    See :class:`limits.storage.base.ReservationSupport` for the
+    synchronous counterpart and the semantics of the lease lifecycle.
+    """
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:  # type: ignore[explicit-any]
+        for method in {
+            "reserve",
+            "commit",
+            "cancel",
+        }:
+            setattr(
+                cls,
+                method,
+                _wrap_errors(getattr(cls, method)),
+            )
+        super().__init_subclass__(**kwargs)
+
+    @abstractmethod
+    async def reserve(
+        self,
+        key: str,
+        limit: int,
+        expiry: float,
+        amount: int = 1,
+        lease_expiry: float | None = None,
+    ) -> Lease | None:
+        """
+        :param key: rate limit key to reserve from
+        :param limit: amount of entries allowed
+        :param expiry: expiry of the window the reservation belongs to
+        :param amount: the (upper bound) amount to reserve
+        :param lease_expiry: seconds until the lease itself expires and
+         is released. Defaults to ``expiry``.
+        :return: the lease, or ``None`` if the reservation would exceed
+         the limit
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def commit(self, lease: Lease, cost: int) -> None:
+        """
+        Settle ``lease`` with the actual ``cost``, releasing the
+        unconsumed remainder of the reservation
+
+        :param lease: the lease returned by :meth:`reserve`
+        :param cost: the actual cost, must not exceed the reserved amount
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def cancel(self, lease: Lease) -> None:
+        """
+        Release the full reservation held by ``lease``
+
+        :param lease: the lease returned by :meth:`reserve`
+        """
+        raise NotImplementedError

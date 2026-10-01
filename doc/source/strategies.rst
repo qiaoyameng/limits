@@ -40,6 +40,29 @@ For example, with a rate limit of 10 requests per minute:
    with large windows with finer-granularity ones
    (e.g., combine a 2 requests per second limit with a 10 requests per minute limit).
 
+Reserving cost up front
+-----------------------
+
+When the actual cost of an operation is only known after it completes, the
+fixed window strategy supports a reserve/commit/cancel flow (currently only
+with the in memory storage, both synchronous and async):
+
+- ``reserve(item, *identifiers, cost=..., lease_expiry=...)`` deducts an upper
+  bound cost from the window and returns an opaque
+  :class:`limits.storage.Lease`, or ``None`` if the reservation would exceed
+  the limit. The lease binds the rate limit key, the window generation, the
+  reserved amount and its own expiry.
+- ``commit(lease, cost)`` settles the lease with the actual cost (which must
+  not exceed the reserved amount) and releases the unconsumed remainder.
+  Repeating the same settlement is idempotent; settling with a conflicting
+  outcome raises :exc:`limits.errors.LeaseConflictError`.
+- ``cancel(lease)`` releases the full reservation.
+
+Reservations expire after ``lease_expiry`` seconds (defaulting to the window
+expiry), at which point the unconsumed amount is released back to the window
+it was reserved from. A commit or cancel that arrives after the window has
+rotated or the lease has expired never recharges the new window.
+
 
 Moving Window
 =============
@@ -129,6 +152,5 @@ Suppose:
    clock intervals), while others adjust buckets dynamically based on the first hit.
    This difference can allow an attacker to bypass limits during the initial sampling
    period. The affected implementations are ``memcached`` and ``in-memory``.
-
 
 

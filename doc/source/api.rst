@@ -143,6 +143,8 @@ Abstract storage classes
 .. autoclass:: limits.storage.Storage
 .. autoclass:: limits.storage.MovingWindowSupport
 .. autoclass:: limits.storage.SlidingWindowCounterSupport
+.. autoclass:: limits.storage.ReservationSupport
+.. autoclass:: limits.storage.Lease
 
 
 Async Abstract storage classes
@@ -151,6 +153,7 @@ Async Abstract storage classes
 .. autoclass:: limits.aio.storage.Storage
 .. autoclass:: limits.aio.storage.MovingWindowSupport
 .. autoclass:: limits.aio.storage.SlidingWindowCounterSupport
+.. autoclass:: limits.aio.storage.ReservationSupport
 
 
 Rate Limits

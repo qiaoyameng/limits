@@ -3,18 +3,22 @@ from __future__ import annotations
 import asyncio
 import bisect
 import time
+import uuid
 from collections import Counter, defaultdict
 from math import floor
 
 from deprecated.sphinx import versionadded
 
 import limits.typing
+from limits import errors
 from limits.aio.storage.base import (
     MovingWindowSupport,
+    ReservationSupport,
     SlidingWindowCounterSupport,
     Storage,
 )
-from limits.storage.base import TimestampedSlidingWindow
+from limits.storage.base import Lease, TimestampedSlidingWindow
+from limits.storage.memory import LeaseRecord
 
 
 class Entry:
@@ -25,7 +29,11 @@ class Entry:
 
 @versionadded(version="2.1")
 class MemoryStorage(
-    Storage, MovingWindowSupport, SlidingWindowCounterSupport, TimestampedSlidingWindow
+    Storage,
+    MovingWindowSupport,
+    SlidingWindowCounterSupport,
+    TimestampedSlidingWindow,
+    ReservationSupport,
 ):
     """
     rate limit storage using :class:`collections.Counter`
@@ -46,6 +54,7 @@ class MemoryStorage(
         self.locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self.expirations: dict[str, float] = {}
         self.events: dict[str, list[Entry]] = {}
+        self.leases: dict[str, LeaseRecord] = {}
         self.timer: asyncio.Task[None] | None = None
         super().__init__(uri, wrap_exceptions=wrap_exceptions, **_)
 
@@ -83,6 +92,13 @@ class MemoryStorage(
                     self.storage.pop(key, None)
                     self.expirations.pop(key, None)
                     self.locks.pop(key, None)
+
+            for lease_id in list(self.leases.keys()):
+                record = self.leases.get(lease_id)
+                if record and record.lease.expires_at <= time.time():
+                    async with self.locks[record.lease.key]:
+                        self.__release_lease(record)
+                        self.leases.pop(lease_id, None)
         except asyncio.CancelledError:
             return
 
@@ -144,6 +160,129 @@ class MemoryStorage(
         self.expirations.pop(key, None)
         self.events.pop(key, None)
         self.locks.pop(key, None)
+        for lease_id, record in list(self.leases.items()):
+            if record.lease.key == key:
+                self.leases.pop(lease_id, None)
+
+    def __release_lease(self, record: LeaseRecord) -> None:
+        """
+        releases the unconsumed reservation of an open lease back to
+        the window it was reserved from, provided that window is still
+        current (i.e. the window generation matches).
+        """
+        lease = record.lease
+        if record.state == "open" and self.expirations.get(lease.key) == (
+            lease.generation
+        ):
+            self.storage[lease.key] = max(
+                self.storage.get(lease.key, 0) - lease.amount, 0
+            )
+
+    async def reserve(
+        self,
+        key: str,
+        limit: int,
+        expiry: float,
+        amount: int = 1,
+        lease_expiry: float | None = None,
+    ) -> Lease | None:
+        """
+        :param key: rate limit key to reserve from
+        :param limit: amount of entries allowed
+        :param expiry: expiry of the window the reservation belongs to
+        :param amount: the (upper bound) amount to reserve
+        :param lease_expiry: seconds until the lease itself expires and
+         is released. Defaults to ``expiry``.
+        :return: the lease, or ``None`` if the reservation would exceed
+         the limit
+        """
+        if amount < 1:
+            raise ValueError("amount must be at least 1")
+        if amount > limit:
+            return None
+
+        await self.get(key)
+        await self.__schedule_expiry()
+        now = time.time()
+        async with self.locks[key]:
+            if self.storage.get(key, 0) + amount > limit:
+                return None
+            self.storage[key] += amount
+            if self.storage[key] == amount:
+                self.expirations[key] = now + expiry
+            lease = Lease(
+                lease_id=uuid.uuid4().hex,
+                key=key,
+                generation=self.expirations[key],
+                amount=amount,
+                expires_at=now + (expiry if lease_expiry is None else lease_expiry),
+            )
+            self.leases[lease.lease_id] = LeaseRecord(lease)
+            return lease
+
+    async def commit(self, lease: Lease, cost: int) -> None:
+        """
+        settles ``lease`` with the actual ``cost`` and releases the
+        unconsumed remainder of the reservation
+
+        :param lease: the lease returned by :meth:`reserve`
+        :param cost: the actual cost, must not exceed the reserved amount
+        """
+        if cost < 0:
+            raise ValueError(f"cost {cost} must not be negative")
+        if cost > lease.amount:
+            raise ValueError(
+                f"cost {cost} exceeds the reserved amount {lease.amount}"
+            )
+
+        await self.__schedule_expiry()
+        async with self.locks[lease.key]:
+            record = self.leases.get(lease.lease_id)
+            if record is None:
+                raise errors.LeaseExpiredError(lease.lease_id)
+            if record.state == "open" and record.lease.expires_at <= time.time():
+                self.__release_lease(record)
+                self.leases.pop(lease.lease_id, None)
+                raise errors.LeaseExpiredError(lease.lease_id)
+            if record.state == "committed":
+                if record.settled_cost == cost:
+                    return
+                raise errors.LeaseConflictError(lease.lease_id)
+            if record.state == "cancelled":
+                raise errors.LeaseConflictError(lease.lease_id)
+
+            refund = record.lease.amount - cost
+            if refund and self.expirations.get(record.lease.key) == (
+                record.lease.generation
+            ):
+                self.storage[record.lease.key] = max(
+                    self.storage.get(record.lease.key, 0) - refund, 0
+                )
+            record.state = "committed"
+            record.settled_cost = cost
+
+    async def cancel(self, lease: Lease) -> None:
+        """
+        releases the full reservation held by ``lease``
+
+        :param lease: the lease returned by :meth:`reserve`
+        """
+        await self.__schedule_expiry()
+        async with self.locks[lease.key]:
+            record = self.leases.get(lease.lease_id)
+            if record is None:
+                raise errors.LeaseExpiredError(lease.lease_id)
+            if record.state == "open" and record.lease.expires_at <= time.time():
+                self.__release_lease(record)
+                self.leases.pop(lease.lease_id, None)
+                raise errors.LeaseExpiredError(lease.lease_id)
+            if record.state == "cancelled":
+                return
+            if record.state == "committed":
+                raise errors.LeaseConflictError(lease.lease_id)
+
+            self.__release_lease(record)
+            record.state = "cancelled"
 
     async def acquire_entry(
         self, key: str, limit: int, expiry: int, amount: int = 1
@@ -276,6 +415,7 @@ class MemoryStorage(
         self.expirations.clear()
         self.events.clear()
         self.locks.clear()
+        self.leases.clear()
 
         return num_items
 

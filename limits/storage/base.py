@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import functools
 from abc import ABC, abstractmethod
 
@@ -244,3 +245,112 @@ class TimestampedSlidingWindow:
         The return value will be the tuple ``("mykey/28976271", "mykey/28976270")``.
         """
         return f"{key}/{int((at - expiry) / expiry)}", f"{key}/{int(at / expiry)}"
+
+
+@dataclasses.dataclass(frozen=True)
+class Lease:
+    """
+    Opaque reservation lease returned by
+    :meth:`ReservationSupport.reserve`.
+
+    The lease binds a rate limit ``key``, the ``generation`` of the
+    window the reservation was taken from, the reserved ``amount``
+    and the moment the lease itself expires (``expires_at``).
+
+    It should be treated as an opaque token and passed back to
+    :meth:`ReservationSupport.commit` or :meth:`ReservationSupport.cancel`.
+    """
+
+    lease_id: str
+    key: str
+    generation: float
+    amount: int
+    expires_at: float
+
+
+class ReservationSupport(ABC):
+    """
+    Abstract base class for storages that support
+    reserve/commit/cancel semantics for the
+    :ref:`strategies:fixed window` strategy.
+
+    A reservation deducts an upper bound cost from the window up
+    front and hands out an opaque :class:`Lease`. The reservation is
+    later either settled with the actual cost (:meth:`commit`) or
+    released in full (:meth:`cancel`). Reservations carry their own
+    expiry, after which the unconsumed amount is released back to
+    the window it was reserved from, provided that window is still
+    current.
+    """
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:  # type: ignore[explicit-any]
+        for method in {
+            "reserve",
+            "commit",
+            "cancel",
+        }:
+            setattr(
+                cls,
+                method,
+                _wrap_errors(getattr(cls, method)),
+            )
+        super().__init_subclass__(**kwargs)
+
+    @abstractmethod
+    def reserve(
+        self,
+        key: str,
+        limit: int,
+        expiry: float,
+        amount: int = 1,
+        lease_expiry: float | None = None,
+    ) -> Lease | None:
+        """
+        Reserve ``amount`` against ``key`` without exceeding ``limit``
+        and return an opaque lease for the reservation.
+
+        :param key: rate limit key to reserve from
+        :param limit: amount of entries allowed
+        :param expiry: expiry of the window the reservation belongs to
+        :param amount: the (upper bound) amount to reserve
+        :param lease_expiry: seconds until the lease itself expires and
+         is released. Defaults to ``expiry``.
+        :return: the lease, or ``None`` if the reservation would exceed
+         the limit
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def commit(self, lease: Lease, cost: int) -> None:
+        """
+        Settle ``lease`` with the actual ``cost``, releasing the
+        unconsumed remainder of the reservation.
+
+        Committing the same cost repeatedly is idempotent. Committing a
+        different cost, or committing a cancelled lease, raises
+        :exc:`limits.errors.LeaseConflictError`.
+
+        :param lease: the lease returned by :meth:`reserve`
+        :param cost: the actual cost, must not exceed the reserved amount
+        :raises limits.errors.LeaseExpiredError: if the lease is unknown
+         or expired
+        :raises limits.errors.LeaseConflictError: on conflicting settlement
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def cancel(self, lease: Lease) -> None:
+        """
+        Release the full reservation held by ``lease``.
+
+        Cancelling twice is idempotent. Cancelling a committed lease
+        raises :exc:`limits.errors.LeaseConflictError`. A cancel that
+        arrives after the window has rotated or the lease has expired
+        never recharges the new window.
+
+        :param lease: the lease returned by :meth:`reserve`
+        :raises limits.errors.LeaseExpiredError: if the lease is unknown
+         or expired
+        :raises limits.errors.LeaseConflictError: on conflicting settlement
+        """
+        raise NotImplementedError
