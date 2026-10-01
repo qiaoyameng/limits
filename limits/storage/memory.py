@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import bisect
 import threading
 import time
 from collections import Counter, defaultdict
@@ -16,9 +15,12 @@ from limits.storage.base import (
 
 
 class Entry:
-    def __init__(self, expiry: float) -> None:
+    __slots__ = ("atime", "expiry", "weight")
+
+    def __init__(self, expiry: float, weight: int = 1) -> None:
         self.atime = time.time()
         self.expiry = self.atime + expiry
+        self.weight = weight
 
 
 class MemoryStorage(
@@ -58,15 +60,17 @@ class MemoryStorage(
         self.timer.start()
 
     def __expire_events(self) -> None:
+        now = time.time()
         for key in list(self.events.keys()):
             with self.locks[key]:
-                if events := self.events.get(key, []):
-                    oldest = bisect.bisect_left(
-                        events, -time.time(), key=lambda event: -event.expiry
-                    )
-                    self.events[key] = self.events[key][:oldest]
-                if not self.events.get(key, None):
-                    self.locks.pop(key, None)
+                events = self.events.get(key)
+                if events is None:
+                    continue
+                active_events = [event for event in events if event.expiry > now]
+                if active_events:
+                    self.events[key] = active_events
+                else:
+                    self.events.pop(key, None)
         for key in list(self.expirations.keys()):
             if self.expirations[key] <= time.time():
                 self.storage.pop(key, None)
@@ -148,18 +152,49 @@ class MemoryStorage(
 
         self.__schedule_expiry()
         with self.locks[key]:
-            self.events.setdefault(key, [])
             timestamp = time.time()
-            try:
-                entry = self.events[key][limit - amount]
-            except IndexError:
-                entry = None
-
-            if entry and entry.atime >= timestamp - expiry:
-                return False
+            events = self.events.get(key, [])
+            active_events = [event for event in events if event.expiry > timestamp]
+            if active_events:
+                self.events[key] = active_events
             else:
-                self.events[key][:0] = [Entry(expiry)] * amount
+                self.events.pop(key, None)
+
+            cutoff = timestamp - expiry
+            used = 0
+            for event in active_events:
+                if event.atime <= cutoff:
+                    break
+                used += event.weight
+
+            if used + amount > limit:
+                return False
+
+            if amount == 0:
                 return True
+
+            event_expiry = timestamp + expiry
+            events = self.events.get(key)
+            if events is None:
+                self.events[key] = [Entry(expiry, amount)]
+                return True
+
+            for event in events:
+                if event.atime != timestamp:
+                    break
+                if event.expiry == event_expiry:
+                    event.weight += amount
+                    return True
+            insert_at = next(
+                (
+                    index
+                    for index, event in enumerate(events)
+                    if event.atime < timestamp
+                ),
+                len(events),
+            )
+            events.insert(insert_at, Entry(expiry, amount))
+            return True
 
     def get_expiry(self, key: str) -> float:
         """
@@ -178,12 +213,19 @@ class MemoryStorage(
         :return: (start of window, number of acquired entries)
         """
         timestamp = time.time()
-        if events := self.events.get(key, []):
-            oldest = bisect.bisect_left(
-                events, -(timestamp - expiry), key=lambda entry: -entry.atime
-            )
-            return events[oldest - 1].atime, oldest
-        return timestamp, 0
+        with self.locks[key]:
+            events = self.events.get(key, [])
+            count = 0
+            start = events[-1].atime if events else timestamp
+            cutoff = timestamp - expiry
+            for event in events:
+                if event.expiry <= timestamp:
+                    continue
+                if event.atime <= cutoff:
+                    break
+                count += event.weight
+                start = event.atime
+            return start, count
 
     def acquire_sliding_window_entry(
         self,
