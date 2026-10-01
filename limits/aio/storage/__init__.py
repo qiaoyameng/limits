@@ -5,7 +5,7 @@ Implementations of storage backends to be used with
 
 from __future__ import annotations
 
-from .base import MovingWindowSupport, SlidingWindowCounterSupport, Storage
+from .base import GCRASupport, MovingWindowSupport, SlidingWindowCounterSupport, Storage
 from .memcached import MemcachedStorage
 from .memory import MemoryStorage
 from .mongodb import MongoDBStorage
@@ -13,6 +13,7 @@ from .redis import RedisClusterStorage, RedisSentinelStorage, RedisStorage
 
 __all__ = [
     "MemcachedStorage",
+    "GCRASupport",
     "MemoryStorage",
     "MongoDBStorage",
     "MovingWindowSupport",

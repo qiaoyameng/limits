@@ -10,12 +10,13 @@ from math import floor, inf
 
 from deprecated.sphinx import versionadded
 
+from ..gcra import GCRAParameters, evaluate, remaining, reset_time
 from ..limits import RateLimitItem
 from ..storage import StorageTypes
 from ..typing import cast
 from ..util import WindowStats
 from .storage import MovingWindowSupport, Storage
-from .storage.base import SlidingWindowCounterSupport
+from .storage.base import GCRASupport, SlidingWindowCounterSupport
 
 
 class RateLimiter(ABC):
@@ -324,8 +325,98 @@ class SlidingWindowCounterRateLimiter(RateLimiter):
         ).clear_sliding_window(item.key_for(*identifiers), item.get_expiry())
 
 
+
+@versionadded(version="4.6")
+class GCRARateLimiter(RateLimiter):
+    """
+    Reference: :ref:`strategies:gcra`
+    """
+
+    def __init__(self, storage: StorageTypes) -> None:
+        if not hasattr(storage, "acquire_gcra_entry") or not hasattr(
+            storage, "get_gcra_state"
+        ):
+            raise NotImplementedError(
+                "GCRARateLimiting is not implemented for storage "
+                f"of type {storage.__class__}"
+            )
+        super().__init__(storage)
+
+    @staticmethod
+    def _parameters(item: RateLimitItem) -> GCRAParameters:
+        return GCRAParameters.from_rate_limit(item)
+
+    async def hit(self, item: RateLimitItem, *identifiers: str, cost: int = 1) -> bool:
+        """
+        Consume the rate limit
+
+        :param item: the rate limit item
+        :param identifiers: variable list of strings to uniquely identify the
+         limit
+        :param cost: The cost of this hit, default 1
+
+        :return: True if ``cost`` could be deducted from the rate limit without exceeding it
+        """
+        params = self._parameters(item)
+        result = await cast(GCRASupport, self.storage).acquire_gcra_entry(
+            item.key_for(*identifiers),
+            params.emission_interval,
+            params.burst_limit,
+            amount=cost,
+        )
+        return result.allowed
+
+    async def test(self, item: RateLimitItem, *identifiers: str, cost: int = 1) -> bool:
+        """
+        Check if the rate limit can be consumed without advancing the
+        theoretical arrival time.
+
+        :param item: the rate limit item
+        :param identifiers: variable list of strings to uniquely identify the
+         limit
+        :param cost: The expected cost to be consumed, default 1
+
+        :return: True if the rate limit is not depleted
+        """
+        params = self._parameters(item)
+        now, state = await cast(GCRASupport, self.storage).get_gcra_state(
+            item.key_for(*identifiers)
+        )
+        return evaluate(
+            now,
+            state,
+            params.emission_interval,
+            params.burst_limit,
+            cost,
+        ).allowed
+
+    async def get_window_stats(
+        self, item: RateLimitItem, *identifiers: str
+    ) -> WindowStats:
+        """
+        Query the earliest retry time and remaining amount for the limit.
+
+        The reset time is the earliest time a unit cost request is accepted,
+        not the boundary of a fixed window.
+
+        :param item: the rate limit item
+        :param identifiers: variable list of strings to uniquely identify the
+         limit
+        :return: (reset time, remaining)
+        """
+        params = self._parameters(item)
+        now, state = await cast(GCRASupport, self.storage).get_gcra_state(
+            item.key_for(*identifiers)
+        )
+        return WindowStats(
+            reset_time(now, state, params.emission_interval, params.burst_amount),
+            remaining(state, params.emission_interval, params.burst_amount),
+        )
+
+
 STRATEGIES = {
     "sliding-window-counter": SlidingWindowCounterRateLimiter,
     "fixed-window": FixedWindowRateLimiter,
     "moving-window": MovingWindowRateLimiter,
+    "gcra": GCRARateLimiter,
 }

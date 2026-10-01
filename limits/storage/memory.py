@@ -7,12 +7,15 @@ from collections import Counter, defaultdict
 from math import floor
 
 import limits.typing
+from limits.gcra import GCRState, evaluate
 from limits.storage.base import (
+    GCRASupport,
     MovingWindowSupport,
     SlidingWindowCounterSupport,
     Storage,
     TimestampedSlidingWindow,
 )
+from limits.typing import Callable
 
 
 class Entry:
@@ -22,7 +25,11 @@ class Entry:
 
 
 class MemoryStorage(
-    Storage, MovingWindowSupport, SlidingWindowCounterSupport, TimestampedSlidingWindow
+    Storage,
+    MovingWindowSupport,
+    SlidingWindowCounterSupport,
+    GCRASupport,
+    TimestampedSlidingWindow,
 ):
     """
     rate limit storage using :class:`collections.Counter`
@@ -33,11 +40,19 @@ class MemoryStorage(
 
     STORAGE_SCHEME = ["memory"]
 
-    def __init__(self, uri: str | None = None, wrap_exceptions: bool = False, **_: str):
+    def __init__(
+        self,
+        uri: str | None = None,
+        wrap_exceptions: bool = False,
+        clock: Callable[[], float] | None = None,
+        **_: limits.typing.Any,
+    ):
         self.storage: limits.typing.Counter[str] = Counter()
         self.locks: defaultdict[str, threading.RLock] = defaultdict(threading.RLock)
         self.expirations: dict[str, float] = {}
         self.events: dict[str, list[Entry]] = {}
+        self.gcra: dict[str, tuple[GCRState, float]] = {}
+        self.clock = clock or time.time
         self._timer_lock = threading.Lock()
         self.timer: threading.Timer = threading.Timer(0.01, self.__expire_events)
         self.timer.start()
@@ -58,6 +73,16 @@ class MemoryStorage(
         self.timer.start()
 
     def __expire_events(self) -> None:
+        now = self.clock()
+        for key in list(self.gcra.keys()):
+            with self.locks[key]:
+                record = self.gcra.get(key)
+                if record is None:
+                    continue
+                (base, units), interval = record
+                if base + units * interval <= now:
+                    self.gcra.pop(key, None)
+                    self.locks.pop(key, None)
         for key in list(self.events.keys()):
             with self.locks[key]:
                 if events := self.events.get(key, []):
@@ -134,6 +159,7 @@ class MemoryStorage(
         self.storage.pop(key, None)
         self.expirations.pop(key, None)
         self.events.pop(key, None)
+        self.gcra.pop(key, None)
         self.locks.pop(key, None)
 
     def acquire_entry(self, key: str, limit: int, expiry: int, amount: int = 1) -> bool:
@@ -247,6 +273,51 @@ class MemoryStorage(
         self.clear(previous_key)
         self.clear(current_key)
 
+    def acquire_gcra_entry(
+        self,
+        key: str,
+        emission_interval: float,
+        burst_limit: float,
+        amount: int = 1,
+    ):
+        """
+        :param key: rate limit key
+        :param emission_interval: time occupied by one unit of cost
+        :param burst_limit: burst limit in seconds
+        :param amount: cost of the request
+        """
+        with self.locks[key]:
+            now = self.clock()
+            record = self.gcra.pop(key, None)
+            state = record[0] if record is not None else None
+            if state is not None:
+                base, units = state
+                if base + units * emission_interval <= now:
+                    state = None
+            result = evaluate(now, state, emission_interval, burst_limit, amount)
+            if result.allowed:
+                self.gcra[key] = (result.state, emission_interval)
+            elif state is not None:
+                self.gcra[key] = (state, emission_interval)
+            return result
+
+    def get_gcra_state(self, key: str) -> tuple[float, GCRState | None]:
+        """
+        :param key: rate limit key
+        :return: ``(now, state)``
+        """
+        now = self.clock()
+        with self.locks[key]:
+            record = self.gcra.get(key)
+            if record is None:
+                return now, None
+            state, interval = record
+            base, units = state
+            if base + units * interval <= now:
+                self.gcra.pop(key, None)
+                return now, None
+            return now, state
+
     def check(self) -> bool:
         """
         check if storage is healthy
@@ -255,9 +326,10 @@ class MemoryStorage(
         return True
 
     def reset(self) -> int | None:
-        num_items = max(len(self.storage), len(self.events))
+        num_items = max(len(self.storage), len(self.events), len(self.gcra))
         self.storage.clear()
         self.expirations.clear()
         self.events.clear()
+        self.gcra.clear()
         self.locks.clear()
         return num_items

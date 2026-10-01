@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from deprecated.sphinx import versionadded
 
 from limits import errors
+from limits.gcra import GCRAAllowance, GCRState
 from limits._storage_scheme import StorageRegistry
 from limits.typing import (
     Any,
@@ -232,3 +233,56 @@ class SlidingWindowCounterSupport(ABC):
         :param expiry: the rate limit expiry, needed to compute the key in some implemenations
         """
         ...
+
+
+@versionadded(version="4.6")
+class GCRASupport(ABC):
+    """
+    Abstract base class for async storages that support
+    the :ref:`strategies:gcra` strategy.
+
+    Implementations keep a single theoretical arrival time per key instead
+    of one entry per request.
+    """
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:  # type: ignore[explicit-any]
+        for method in {
+            "acquire_gcra_entry",
+            "get_gcra_state",
+        }:
+            setattr(cls, method, _wrap_errors(getattr(cls, method)))
+        super().__init_subclass__(**kwargs)
+
+    @abstractmethod
+    async def acquire_gcra_entry(
+        self,
+        key: str,
+        emission_interval: float,
+        burst_limit: float,
+        amount: int = 1,
+    ) -> GCRAAllowance:
+        """
+        Consume ``amount`` units of the rate limit identified by ``key``.
+
+        The stored theoretical arrival time is only advanced when the request
+        is allowed. A request whose ``amount`` cannot fit within
+        ``burst_limit`` is rejected without modifying the state.
+
+        :param key: rate limit key
+        :param emission_interval: time occupied by one unit of cost
+        :param burst_limit: burst limit in seconds
+        :param amount: cost of the request
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_gcra_state(self, key: str) -> tuple[float, GCRState | None]:
+        """
+        Return the current time and the stored GCRA state for ``key``.
+        Fully expired state is reported as ``None``. This call only removes
+        state that is already past its expiry; it never reserves capacity.
+
+        :param key: rate limit key
+        :return: ``(now, state)``
+        """
+        raise NotImplementedError
