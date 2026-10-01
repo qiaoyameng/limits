@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import bisect
 import threading
 import time
 from collections import Counter, defaultdict
@@ -16,9 +15,16 @@ from limits.storage.base import (
 
 
 class Entry:
-    def __init__(self, expiry: float) -> None:
-        self.atime = time.time()
+    def __init__(
+        self, expiry: float, weight: int = 1, atime: float | None = None
+    ) -> None:
+        self.atime = time.time() if atime is None else atime
         self.expiry = self.atime + expiry
+        self.weight = weight
+
+    def __setstate__(self, state: dict[str, limits.typing.Any]) -> None:
+        state.setdefault("weight", 1)
+        self.__dict__.update(state)
 
 
 class MemoryStorage(
@@ -58,14 +64,16 @@ class MemoryStorage(
         self.timer.start()
 
     def __expire_events(self) -> None:
+        now = time.time()
         for key in list(self.events.keys()):
             with self.locks[key]:
-                if events := self.events.get(key, []):
-                    oldest = bisect.bisect_left(
-                        events, -time.time(), key=lambda event: -event.expiry
-                    )
-                    self.events[key] = self.events[key][:oldest]
-                if not self.events.get(key, None):
+                active_events = [
+                    event for event in self.events.get(key, []) if event.expiry > now
+                ]
+                if active_events:
+                    self.events[key] = active_events
+                else:
+                    self.events.pop(key, None)
                     self.locks.pop(key, None)
         for key in list(self.expirations.keys()):
             if self.expirations[key] <= time.time():
@@ -136,7 +144,9 @@ class MemoryStorage(
         self.events.pop(key, None)
         self.locks.pop(key, None)
 
-    def acquire_entry(self, key: str, limit: int, expiry: int, amount: int = 1) -> bool:
+    def acquire_entry(
+        self, key: str, limit: int, expiry: int, amount: int = 1
+    ) -> bool:
         """
         :param key: rate limit key to acquire an entry in
         :param limit: amount of entries allowed
@@ -148,18 +158,29 @@ class MemoryStorage(
 
         self.__schedule_expiry()
         with self.locks[key]:
-            self.events.setdefault(key, [])
             timestamp = time.time()
-            try:
-                entry = self.events[key][limit - amount]
-            except IndexError:
-                entry = None
+            events = self.events.get(key)
+            if events is None:
+                events = []
+                self.events[key] = events
 
-            if entry and entry.atime >= timestamp - expiry:
+            current_weight = sum(
+                event.weight
+                for event in events
+                if event.expiry >= timestamp
+                and event.atime >= timestamp - expiry
+            )
+            if current_weight + amount > limit:
                 return False
-            else:
-                self.events[key][:0] = [Entry(expiry)] * amount
-                return True
+
+            event_expiry = timestamp + expiry
+            for event in events:
+                if event.atime == timestamp and event.expiry == event_expiry:
+                    event.weight += amount
+                    return True
+
+            events.insert(0, Entry(expiry, amount, timestamp))
+            return True
 
     def get_expiry(self, key: str) -> float:
         """
@@ -178,12 +199,19 @@ class MemoryStorage(
         :return: (start of window, number of acquired entries)
         """
         timestamp = time.time()
-        if events := self.events.get(key, []):
-            oldest = bisect.bisect_left(
-                events, -(timestamp - expiry), key=lambda entry: -entry.atime
-            )
-            return events[oldest - 1].atime, oldest
-        return timestamp, 0
+        window_start = timestamp
+        count = 0
+        events = self.events.get(key, [])
+        cutoff = timestamp - expiry
+        valid_events = [event for event in events if event.atime > cutoff]
+
+        if valid_events:
+            window_start = valid_events[-1].atime
+            count = sum(event.weight for event in valid_events)
+        elif events:
+            window_start = events[-1].atime
+
+        return window_start, count
 
     def acquire_sliding_window_entry(
         self,
