@@ -127,7 +127,8 @@ class RateLimitItem(metaclass=RateLimitItemMeta):
         if isinstance(other, RateLimitItem):
             return (
                 self.amount == other.amount
-                and self.GRANULARITY == other.GRANULARITY
+                and self.GRANULARITY
+                == getattr(other, "GRANULARITY", None)
                 and self.multiples == other.multiples
             )
         return False
@@ -136,7 +137,10 @@ class RateLimitItem(metaclass=RateLimitItemMeta):
         return f"{self.amount} per {self.multiples} {self.GRANULARITY.name}"
 
     def __lt__(self, other: RateLimitItem) -> bool:
-        return self.GRANULARITY.seconds < other.GRANULARITY.seconds
+        other_granularity = getattr(other, "GRANULARITY", None)
+        if other_granularity is None:
+            return NotImplemented
+        return self.GRANULARITY.seconds < other_granularity.seconds
 
     def __hash__(self) -> int:
         return hash((self.namespace, self.amount, self.multiples, self.GRANULARITY))

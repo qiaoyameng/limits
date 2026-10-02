@@ -10,12 +10,17 @@ from math import floor, inf
 
 from deprecated.sphinx import versionadded
 
+from ..calendar import CalendarRateLimitItem, reject_non_fixed_window
 from ..limits import RateLimitItem
 from ..storage import StorageTypes
 from ..typing import cast
 from ..util import WindowStats
 from .storage import MovingWindowSupport, Storage
 from .storage.base import SlidingWindowCounterSupport
+
+
+def _reject_calendar_limit(item: RateLimitItem) -> None:
+    reject_non_fixed_window(item)
 
 
 class RateLimiter(ABC):
@@ -96,6 +101,7 @@ class MovingWindowRateLimiter(RateLimiter):
         :return: True if ``cost`` could be deducted from the rate limit without exceeding it
         """
 
+        _reject_calendar_limit(item)
         return await cast(MovingWindowSupport, self.storage).acquire_entry(
             item.key_for(*identifiers), item.amount, item.get_expiry(), amount=cost
         )
@@ -111,6 +117,7 @@ class MovingWindowRateLimiter(RateLimiter):
 
         :return: True if the rate limit is not depleted
         """
+        _reject_calendar_limit(item)
         res = await cast(MovingWindowSupport, self.storage).get_moving_window(
             item.key_for(*identifiers),
             item.amount,
@@ -131,12 +138,17 @@ class MovingWindowRateLimiter(RateLimiter):
          limit
         :return: (reset time, remaining)
         """
+        _reject_calendar_limit(item)
         window_start, window_items = await cast(
             MovingWindowSupport, self.storage
         ).get_moving_window(item.key_for(*identifiers), item.amount, item.get_expiry())
         reset = window_start + item.get_expiry()
 
         return WindowStats(reset, item.amount - window_items)
+
+    async def clear(self, item: RateLimitItem, *identifiers: str) -> None:
+        _reject_calendar_limit(item)
+        return await super().clear(item, *identifiers)
 
 
 class FixedWindowRateLimiter(RateLimiter):
@@ -156,14 +168,15 @@ class FixedWindowRateLimiter(RateLimiter):
         :return: True if ``cost`` could be deducted from the rate limit without exceeding it
         """
 
-        return (
-            await self.storage.incr(
-                item.key_for(*identifiers),
-                item.get_expiry(),
-                amount=cost,
-            )
-            <= item.amount
-        )
+        now = time.time()
+        if isinstance(item, CalendarRateLimitItem):
+            key = item.key_for(*identifiers, at=now)
+            expiry = item.get_expiry(now)
+        else:
+            key = item.key_for(*identifiers)
+            expiry = item.get_expiry()
+
+        return await self.storage.incr(key, expiry, amount=cost) <= item.amount
 
     async def test(self, item: RateLimitItem, *identifiers: str, cost: int = 1) -> bool:
         """
@@ -177,9 +190,14 @@ class FixedWindowRateLimiter(RateLimiter):
         :return: True if the rate limit is not depleted
         """
 
-        return (
-            await self.storage.get(item.key_for(*identifiers)) < item.amount - cost + 1
+        now = time.time()
+        key = (
+            item.key_for(*identifiers, at=now)
+            if isinstance(item, CalendarRateLimitItem)
+            else item.key_for(*identifiers)
         )
+
+        return await self.storage.get(key) < item.amount - cost + 1
 
     async def get_window_stats(
         self, item: RateLimitItem, *identifiers: str
@@ -192,11 +210,18 @@ class FixedWindowRateLimiter(RateLimiter):
          limit
         :return: reset time, remaining
         """
-        remaining = max(
-            0,
-            item.amount - await self.storage.get(item.key_for(*identifiers)),
-        )
-        reset = await self.storage.get_expiry(item.key_for(*identifiers))
+        now = time.time()
+        if isinstance(item, CalendarRateLimitItem):
+            key = item.key_for(*identifiers, at=now)
+            reset = item.get_reset_at(now)
+        else:
+            key = item.key_for(*identifiers)
+            reset = await self.storage.get_expiry(key)
+
+        used = await self.storage.get(key)
+        remaining = max(0, item.amount - used)
+        if not used and not isinstance(item, CalendarRateLimitItem):
+            reset = now
 
         return WindowStats(reset, remaining)
 
@@ -240,6 +265,7 @@ class SlidingWindowCounterRateLimiter(RateLimiter):
 
         :return: True if ``cost`` could be deducted from the rate limit without exceeding it
         """
+        _reject_calendar_limit(item)
         return await cast(
             SlidingWindowCounterSupport, self.storage
         ).acquire_sliding_window_entry(
@@ -261,6 +287,7 @@ class SlidingWindowCounterRateLimiter(RateLimiter):
         :return: True if the rate limit is not depleted
         """
 
+        _reject_calendar_limit(item)
         previous_count, previous_expires_in, current_count, _ = await cast(
             SlidingWindowCounterSupport, self.storage
         ).get_sliding_window(item.key_for(*identifiers), item.get_expiry())
@@ -284,6 +311,7 @@ class SlidingWindowCounterRateLimiter(RateLimiter):
         :return: (reset time, remaining)
         """
 
+        _reject_calendar_limit(item)
         (
             previous_count,
             previous_expires_in,
@@ -319,6 +347,7 @@ class SlidingWindowCounterRateLimiter(RateLimiter):
         return WindowStats(now + min(previous_reset_in, current_reset_in), remaining)
 
     async def clear(self, item: RateLimitItem, *identifiers: str) -> None:
+        _reject_calendar_limit(item)
         return await cast(
             SlidingWindowCounterSupport, self.storage
         ).clear_sliding_window(item.key_for(*identifiers), item.get_expiry())

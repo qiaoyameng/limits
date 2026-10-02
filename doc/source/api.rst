@@ -182,6 +182,22 @@ declaring a :attr:`GRANULARITY`
 .. autoclass:: RateLimitItemPerMonth
 .. autoclass:: RateLimitItemPerYear
 
+Calendar rate limit granularities
+---------------------------------
+Calendar rate limits use fixed counters aligned to local calendar boundaries.
+They are independent from the fixed-duration granularities above and are only
+supported by the fixed-window strategy.
+
+.. autoclass:: CalendarPeriod
+   :members:
+.. autoclass:: CalendarWindow
+   :members:
+.. autoclass:: CalendarRateLimitItem
+   :members:
+.. autoclass:: RateLimitItemPerCalendarDay
+.. autoclass:: RateLimitItemPerCalendarWeek
+.. autoclass:: RateLimitItemPerCalendarMonth
+.. autoexception:: InvalidTimezoneError
 
 Structures
 ==========

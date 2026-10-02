@@ -71,7 +71,7 @@ class Storage(LazyDependency, metaclass=StorageRegistry):
         raise NotImplementedError
 
     @abstractmethod
-    def incr(self, key: str, expiry: int, amount: int = 1) -> int:
+    def incr(self, key: str, expiry: int | float, amount: int = 1) -> int:
         """
         increments the counter for a given rate limit key
 
