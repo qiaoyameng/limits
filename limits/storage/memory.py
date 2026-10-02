@@ -37,6 +37,7 @@ class MemoryStorage(
         self.storage: limits.typing.Counter[str] = Counter()
         self.locks: defaultdict[str, threading.RLock] = defaultdict(threading.RLock)
         self.expirations: dict[str, float] = {}
+        self.virtual_expirations: set[str] = set()
         self.events: dict[str, list[Entry]] = {}
         self._timer_lock = threading.Lock()
         self.timer: threading.Timer = threading.Timer(0.01, self.__expire_events)
@@ -68,7 +69,10 @@ class MemoryStorage(
                 if not self.events.get(key, None):
                     self.locks.pop(key, None)
         for key in list(self.expirations.keys()):
-            if self.expirations[key] <= time.time():
+            if (
+                key not in self.virtual_expirations
+                and self.expirations[key] <= time.time()
+            ):
                 self.storage.pop(key, None)
                 self.expirations.pop(key, None)
                 self.locks.pop(key, None)
@@ -85,7 +89,9 @@ class MemoryStorage(
     ) -> type[Exception] | tuple[type[Exception], ...]:  # pragma: no cover
         return ValueError
 
-    def incr(self, key: str, expiry: float, amount: int = 1) -> int:
+    def incr(
+        self, key: str, expiry: float, amount: int = 1, at: float | None = None
+    ) -> int:
         """
         increments the counter for a given rate limit key
 
@@ -93,12 +99,16 @@ class MemoryStorage(
         :param expiry: amount in seconds for the key to expire in
         :param amount: the number to increment by
         """
-        self.get(key)
-        self.__schedule_expiry()
+        now = time.time() if at is None else at
+        self.get(key, at=at)
+        if at is None:
+            self.__schedule_expiry()
         with self.locks[key]:
             self.storage[key] += amount
             if self.storage[key] == amount:
-                self.expirations[key] = time.time() + expiry
+                self.expirations[key] = now + expiry
+                if at is not None:
+                    self.virtual_expirations.add(key)
         return self.storage.get(key, 0)
 
     def decr(self, key: str, amount: int = 1) -> int:
@@ -115,15 +125,17 @@ class MemoryStorage(
 
         return self.storage.get(key, 0)
 
-    def get(self, key: str) -> int:
+    def get(self, key: str, at: float | None = None) -> int:
         """
         :param key: the key to get the counter value for
         """
 
-        if self.expirations.get(key, 0) <= time.time():
+        now = time.time() if at is None else at
+        if self.expirations.get(key, 0) <= now:
             self.storage.pop(key, None)
             self.expirations.pop(key, None)
             self.locks.pop(key, None)
+            self.virtual_expirations.discard(key)
 
         return self.storage.get(key, 0)
 
@@ -135,6 +147,7 @@ class MemoryStorage(
         self.expirations.pop(key, None)
         self.events.pop(key, None)
         self.locks.pop(key, None)
+        self.virtual_expirations.discard(key)
 
     def acquire_entry(self, key: str, limit: int, expiry: int, amount: int = 1) -> bool:
         """
@@ -161,12 +174,12 @@ class MemoryStorage(
                 self.events[key][:0] = [Entry(expiry)] * amount
                 return True
 
-    def get_expiry(self, key: str) -> float:
+    def get_expiry(self, key: str, at: float | None = None) -> float:
         """
         :param key: the key to get the expiry for
         """
 
-        return self.expirations.get(key, time.time())
+        return self.expirations.get(key, time.time() if at is None else at)
 
     def get_moving_window(self, key: str, limit: int, expiry: int) -> tuple[float, int]:
         """
@@ -258,6 +271,7 @@ class MemoryStorage(
         num_items = max(len(self.storage), len(self.events))
         self.storage.clear()
         self.expirations.clear()
+        self.virtual_expirations.clear()
         self.events.clear()
         self.locks.clear()
         return num_items

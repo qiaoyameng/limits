@@ -5,6 +5,7 @@ Rate limiting strategies
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from abc import ABCMeta, abstractmethod
 from math import floor, inf
 
@@ -12,8 +13,10 @@ from deprecated.sphinx import versionadded
 
 from limits.storage.base import SlidingWindowCounterSupport
 
+from .calendar import CalendarRateLimitItem, _timestamp
 from .limits import RateLimitItem
 from .storage import MovingWindowSupport, Storage, StorageTypes
+from .storage.memory import MemoryStorage
 from .typing import cast
 from .util import WindowStats
 
@@ -191,6 +194,91 @@ class FixedWindowRateLimiter(RateLimiter):
         return WindowStats(reset, remaining)
 
 
+class CalendarFixedWindowRateLimiter(RateLimiter):
+    """
+    Fixed window strategy whose windows are aligned to calendar boundaries.
+    """
+
+    def hit(
+        self,
+        item: RateLimitItem,
+        *identifiers: str,
+        cost: int = 1,
+        at: float | datetime | None = None,
+    ) -> bool:
+        at = _timestamp(at)
+        calendar_item = cast(CalendarRateLimitItem, item)
+        key = calendar_item.key_for(*identifiers, at=at)
+        if at is not None:
+            if not isinstance(self.storage, MemoryStorage):
+                raise NotImplementedError(
+                    "Explicit timestamps are only supported by in-memory storage."
+                )
+            count = cast(MemoryStorage, self.storage).incr(
+                key, calendar_item.get_expiry(at), amount=cost, at=at
+            )
+        else:
+            count = self.storage.incr(
+                key, calendar_item.get_expiry(at), amount=cost
+            )
+        return count <= item.amount
+
+    def test(
+        self,
+        item: RateLimitItem,
+        *identifiers: str,
+        cost: int = 1,
+        at: float | datetime | None = None,
+    ) -> bool:
+        at = _timestamp(at)
+        calendar_item = cast(CalendarRateLimitItem, item)
+        if at is not None:
+            if not isinstance(self.storage, MemoryStorage):
+                raise NotImplementedError(
+                    "Explicit timestamps are only supported by in-memory storage."
+                )
+            value = self.storage.get(calendar_item.key_for(*identifiers, at=at), at=at)
+        else:
+            value = self.storage.get(calendar_item.key_for(*identifiers, at=at))
+        return value < item.amount - cost + 1
+
+    def get_window_stats(
+        self,
+        item: RateLimitItem,
+        *identifiers: str,
+        at: float | datetime | None = None,
+    ) -> WindowStats:
+        at = _timestamp(at)
+        calendar_item = cast(CalendarRateLimitItem, item)
+        key = calendar_item.key_for(*identifiers, at=at)
+        if at is not None:
+            if not isinstance(self.storage, MemoryStorage):
+                raise NotImplementedError(
+                    "Explicit timestamps are only supported by in-memory storage."
+                )
+            value = self.storage.get(key, at=at)
+        else:
+            value = self.storage.get(key)
+        if value:
+            if at is not None:
+                reset = cast(MemoryStorage, self.storage).get_expiry(key, at=at)
+            else:
+                reset = self.storage.get_expiry(key)
+        else:
+            reset = calendar_item.reset_at(at)
+        return WindowStats(reset, max(0, item.amount - value))
+
+    def clear(
+        self,
+        item: RateLimitItem,
+        *identifiers: str,
+        at: float | datetime | None = None,
+    ) -> None:
+        at = _timestamp(at)
+        calendar_item = cast(CalendarRateLimitItem, item)
+        return self.storage.clear(calendar_item.key_for(*identifiers, at=at))
+
+
 @versionadded(version="4.1")
 class SlidingWindowCounterRateLimiter(RateLimiter):
     """
@@ -309,10 +397,12 @@ KnownStrategy = (
     type[SlidingWindowCounterRateLimiter]
     | type[FixedWindowRateLimiter]
     | type[MovingWindowRateLimiter]
+    | type[CalendarFixedWindowRateLimiter]
 )
 
 STRATEGIES: dict[str, KnownStrategy] = {
     "sliding-window-counter": SlidingWindowCounterRateLimiter,
     "fixed-window": FixedWindowRateLimiter,
+    "calendar-fixed-window": CalendarFixedWindowRateLimiter,
     "moving-window": MovingWindowRateLimiter,
 }

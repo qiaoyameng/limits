@@ -28,6 +28,7 @@ a single parameter: a subclass of :class:`~limits.storage.Storage`.
 Provided by :mod:`limits.strategies`
 
 .. autoclass:: FixedWindowRateLimiter
+.. autoclass:: CalendarFixedWindowRateLimiter
 .. autoclass:: MovingWindowRateLimiter
 .. autoclass:: SlidingWindowCounterRateLimiter
 
@@ -46,6 +47,7 @@ expose async variants and expect a subclass of :class:`limits.aio.storage.Storag
 Provided by :mod:`limits.aio.strategies`
 
 .. autoclass:: FixedWindowRateLimiter
+.. autoclass:: CalendarFixedWindowRateLimiter
 .. autoclass:: MovingWindowRateLimiter
 .. autoclass:: SlidingWindowCounterRateLimiter
 
@@ -172,6 +174,12 @@ All rate limit items implement :class:`RateLimitItem` by
 declaring a :attr:`GRANULARITY`
 
 .. autoclass:: RateLimitItem
+.. autoclass:: CalendarRateLimitItem
+.. autoclass:: CalendarRateLimitItemPerDay
+.. autoclass:: CalendarRateLimitItemPerWeek
+.. autoclass:: CalendarRateLimitItemPerMonth
+.. autoclass:: CalendarPeriod
+.. autoclass:: CalendarWindow
 
 ------
 
